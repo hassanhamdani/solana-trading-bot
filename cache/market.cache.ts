@@ -52,7 +52,27 @@ export class MarketCache {
     return market;
   }
 
-  private fetch(marketId: string): Promise<MinimalMarketLayoutV3> {
-    return getMinimalMarketV3(this.connection, new PublicKey(marketId), this.connection.commitment);
+  private async fetch(marketId: string): Promise<MinimalMarketLayoutV3> {
+    try {
+        const market = await getMinimalMarketV3(this.connection, new PublicKey(marketId), this.connection.commitment);
+        if (!market) {
+            // Skip this market but don't throw
+            logger.debug(`Market ${marketId} not found, might be a different AMM type`);
+            return {
+                eventQueue: new PublicKey(0),
+                bids: new PublicKey(0),
+                asks: new PublicKey(0)
+            };
+        }
+        return market;
+    } catch (error) {
+        logger.debug(`Error fetching market ${marketId}: ${error instanceof Error ? error.message : String(error)}`);
+        // Return empty market structure instead of throwing
+        return {
+            eventQueue: new PublicKey(0),
+            bids: new PublicKey(0),
+            asks: new PublicKey(0)
+        };
+    }
   }
 }
