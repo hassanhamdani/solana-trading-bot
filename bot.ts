@@ -155,59 +155,86 @@ export class Bot {
   }
 
   private async getQuote(mint: PublicKey): Promise<any> {
-    const inputMint = NATIVE_MINT.toString(); // SOL
+    const inputMint = NATIVE_MINT.toString();
     const outputMint = mint.toString();
-    const amount = this.config.quoteAmount.raw.toString();
+    // Ensure minimum amount of 0.001 SOL (1,000,000 lamports)
+    const minAmount = 1_000_000;
+    const amount = Math.max(minAmount, this.config.quoteAmount.raw.toNumber());
     const slippage = this.config.buySlippage;
 
     try {
-        logger.debug('Fetching quote from Jupiter', {
+        logger.info('Preparing quote request:', {
             inputMint,
             outputMint,
-            amount,
-            slippage
+            amount: amount.toString(),
+            slippage,
+            amountInSOL: amount / 1e9
         });
 
-        const url = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippage}`;
-        
-        const response = await fetch(url, {
-            headers: {
+        const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippage}`;
+        logger.info('Requesting quote from:', { url: quoteUrl });
+
+        const quoteResponse = await this.fetchWithRetry(quoteUrl);
+        const quoteData = await quoteResponse.json();
+
+        console.log('Full Quote Response:', JSON.stringify(quoteData, null, 2));
+
+        // Prepare swap request
+        const swapRequestBody = {
+            quoteResponse: quoteData,
+            userPublicKey: this.config.wallet.publicKey.toString(),
+            wrapAndUnwrapSol: true,
+            computeUnitPriceMicroLamports: 1000,
+            prioritizationFeeLamports: 1000,
+            slippageBps: slippage,
+            strict: false
+        };
+
+        console.log('Swap Request Body:', JSON.stringify(swapRequestBody, null, 2));
+
+        const swapResponse = await this.fetchWithRetry('https://quote-api.jup.ag/v6/swap', {
+            method: 'POST',
+            headers: { 
                 'Content-Type': 'application/json'
-            }
+            },
+            body: JSON.stringify(swapRequestBody)
+        });
+        
+        const swapData = await swapResponse.json();
+        
+        // Log the complete swap response
+        console.log('Complete Swap Response:', JSON.stringify(swapData, null, 2));
+        
+        logger.info('Swap Response:', { 
+            status: swapResponse.status,
+            hasSwapTransaction: !!swapData.swapTransaction,
+            error: swapData.error,
+            message: swapData.message,
+            responseKeys: Object.keys(swapData)
         });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            logger.error('Jupiter quote failed', {
-                status: response.status,
-                statusText: response.statusText,
-                error: errorText
+        if (!swapData.swapTransaction) {
+            logger.error('No swap transaction in response', { 
+                status: swapResponse.status,
+                error: swapData.error,
+                message: swapData.message,
+                data: swapData
             });
             return null;
         }
 
-        const quoteData = await response.json();
-
-        // Validate quote data
-        if (!quoteData || !quoteData.swapTransaction) {
-            logger.error('Invalid quote response', { quoteData });
-            return null;
-        }
-
-        logger.debug('Quote received successfully', {
-            routes: quoteData.routePlan?.length || 0,
-            priceImpact: quoteData.priceImpactPct
-        });
-
-        return {
-            data: quoteData
-        };
+        return { data: swapData };
 
     } catch (error) {
-        logger.error('Error fetching quote', {
+        logger.error('Error in getQuote:', {
             error: error instanceof Error ? error.message : String(error),
-            inputMint,
-            outputMint
+            stack: error instanceof Error ? error.stack : undefined,
+            params: {
+                inputMint,
+                outputMint,
+                amount,
+                slippage
+            }
         });
         return null;
     }
