@@ -157,7 +157,6 @@ export class Bot {
   private async getQuote(mint: PublicKey): Promise<any> {
     const inputMint = NATIVE_MINT.toString();
     const outputMint = mint.toString();
-    // Ensure minimum amount of 0.001 SOL (1,000,000 lamports)
     const minAmount = 1_000_000;
     const amount = Math.max(minAmount, this.config.quoteAmount.raw.toNumber());
     const slippage = this.config.buySlippage;
@@ -179,13 +178,13 @@ export class Bot {
 
         console.log('Full Quote Response:', JSON.stringify(quoteData, null, 2));
 
-        // Prepare swap request
+        // Prepare swap request - Remove prioritizationFeeLamports
         const swapRequestBody = {
             quoteResponse: quoteData,
             userPublicKey: this.config.wallet.publicKey.toString(),
             wrapAndUnwrapSol: true,
-            computeUnitPriceMicroLamports: 1000,
-            prioritizationFeeLamports: 1000,
+            computeUnitPriceMicroLamports: 1000,  // Keep only this one
+            // prioritizationFeeLamports: 1000,    // Remove this
             slippageBps: slippage,
             strict: false
         };
