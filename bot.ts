@@ -1,25 +1,16 @@
 import {
-  ComputeBudgetProgram,
   Connection,
   Keypair,
   PublicKey,
-  TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
-import {
-  createAssociatedTokenAccountIdempotentInstruction,
-  createCloseAccountInstruction,
-  getAccount,
-  getAssociatedTokenAddress,
-  TOKEN_PROGRAM_ID,
-} from '@solana/spl-token';
-import { Liquidity, LiquidityPoolKeysV4, LiquidityStateV4, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
-import { MarketCache, PoolCache } from './cache';
+import { Token, TokenAmount } from '@raydium-io/raydium-sdk';
+import { logger } from './helpers';
 import { TransactionExecutor } from './transactions';
-import { createPoolKeys, logger, NETWORK, sleep } from './helpers';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
 import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-executor';
-import { BN } from '@project-serum/anchor';
+import { NATIVE_MINT } from '@solana/spl-token';
+import axios from 'axios';
 
 export interface BotConfig {
   wallet: Keypair;
@@ -28,19 +19,38 @@ export interface BotConfig {
   quoteAta: PublicKey;
   autoBuyDelay: number;
   maxBuyRetries: number;
-  unitLimit: number;
-  unitPrice: number;
   buySlippage: number;
 }
+
+interface JupiterQuoteResponse {
+  inputMint: string;
+  outputMint: string;
+  amount: string;
+  otherAmountThreshold: string;
+  swapMode: string;
+  slippageBps: number;
+  platformFee: unknown;
+  priceImpactPct: string;
+  routePlan: unknown[];
+  contextSlot: number;
+  timeTaken: number;
+}
+
+const JUPITER_RATE_LIMIT = 2000; // 2 seconds between requests
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1 second
 
 export class Bot {
   public readonly isWarp: boolean = false;
   public readonly isJito: boolean = false;
+  private lastJupiterRequest = 0;
+  private readonly jupiterClient = axios.create({
+    baseURL: 'https://quote-api.jup.ag/v6',
+    timeout: 10000
+  });
 
   constructor(
     private readonly connection: Connection,
-    private readonly marketStorage: MarketCache,
-    private readonly poolStorage: PoolCache,
     private readonly txExecutor: TransactionExecutor,
     readonly config: BotConfig,
   ) {
@@ -50,166 +60,215 @@ export class Bot {
 
   async validate() {
     try {
-      await getAccount(this.connection, this.config.quoteAta, this.connection.commitment);
+      const balance = await this.connection.getBalance(this.config.wallet.publicKey);
+      if (balance <= 0) {
+        logger.error(`Insufficient SOL balance in wallet: ${this.config.wallet.publicKey.toString()}`);
+        return false;
+      }
+      return true;
     } catch (error) {
-      logger.error(
-        `${this.config.quoteToken.symbol} token account not found in wallet: ${this.config.wallet.publicKey.toString()}`,
-      );
+      logger.error(`Failed to validate wallet: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
-    return true;
   }
 
-  public async buy(accountId: PublicKey, poolState: LiquidityStateV4) {
-    logger.trace({ mint: poolState.baseMint }, `Processing new pool...`);
+  private async fetchWithRetry(url: string, options?: RequestInit) {
+    for (let i = 0; i < MAX_RETRIES; i++) {
+      try {
+        // Rate limiting for Jupiter API
+        const now = Date.now();
+        const timeSinceLastRequest = now - this.lastJupiterRequest;
+        if (timeSinceLastRequest < JUPITER_RATE_LIMIT) {
+          await new Promise(resolve => setTimeout(resolve, JUPITER_RATE_LIMIT - timeSinceLastRequest));
+        }
+        this.lastJupiterRequest = Date.now();
 
-    if (this.config.autoBuyDelay > 0) {
-      logger.debug({ mint: poolState.baseMint }, `Waiting for ${this.config.autoBuyDelay} ms before buy`);
-      await sleep(this.config.autoBuyDelay);
+        const response = await fetch(url, options);
+        if (response.status === 429) {
+          const retryAfter = response.headers.get('retry-after');
+          const delay = retryAfter ? parseInt(retryAfter) * 1000 : RETRY_DELAY * (i + 1);
+          logger.debug(`Rate limited by Jupiter. Retrying after ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        return response;
+      } catch (error) {
+        if (i === MAX_RETRIES - 1) throw error;
+        logger.debug(`Request failed, retrying... (${error instanceof Error ? error.message : String(error)})`);
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (i + 1)));
+      }
     }
+    throw new Error('Max retries reached');
+  }
+
+  public async buy(mint: PublicKey) {
+    try {
+        // Add validation
+        if (!mint) {
+            logger.error('Invalid mint address provided');
+            return { confirmed: false, error: 'Invalid mint' };
+        }
+
+        // Add delay before buy
+        logger.debug(`Waiting for ${this.config.autoBuyDelay} ms before buy`, { mint: mint.toString() });
+        await new Promise(resolve => setTimeout(resolve, this.config.autoBuyDelay));
+
+        // Get quote first
+        const quoteResponse = await this.getQuote(mint);
+        if (!quoteResponse || !quoteResponse.data) {
+            logger.error('Failed to get quote', { mint: mint.toString() });
+            return { confirmed: false, error: 'Quote failed' };
+        }
+
+        // Validate quote data
+        const { data } = quoteResponse;
+        if (!data.swapTransaction) {
+            logger.error('No swap transaction in quote', { mint: mint.toString() });
+            return { confirmed: false, error: 'Invalid quote' };
+        }
+
+        // Execute the swap
+        logger.debug('Executing transaction...', { mint: mint.toString() });
+        const swapResult = await this.executeSwap(data.swapTransaction);
+
+        if (swapResult.confirmed) {
+            logger.info('Buy transaction confirmed', { 
+                mint: mint.toString(),
+                signature: swapResult.signature 
+            });
+        } else {
+            logger.error('Buy transaction failed', { 
+                mint: mint.toString(),
+                error: swapResult.error 
+            });
+        }
+
+        return swapResult;
+
+    } catch (error) {
+        logger.error('Error in buy function', {
+            mint: mint?.toString(),
+            error: error instanceof Error ? error.message : String(error)
+        });
+        return { confirmed: false, error: String(error) };
+    }
+  }
+
+  private async getQuote(mint: PublicKey): Promise<any> {
+    const inputMint = NATIVE_MINT.toString(); // SOL
+    const outputMint = mint.toString();
+    const amount = this.config.quoteAmount.raw.toString();
+    const slippage = this.config.buySlippage;
 
     try {
-      const [market, mintAta] = await Promise.all([
-        this.marketStorage.get(poolState.marketId.toString()),
-        getAssociatedTokenAddress(poolState.baseMint, this.config.wallet.publicKey),
-      ]);
-      const poolKeys: LiquidityPoolKeysV4 = createPoolKeys(accountId, poolState, market);
+        logger.debug('Fetching quote from Jupiter', {
+            inputMint,
+            outputMint,
+            amount,
+            slippage
+        });
 
-      for (let i = 0; i < this.config.maxBuyRetries; i++) {
-        try {
-          logger.info(
-            { mint: poolState.baseMint.toString() },
-            `Send buy transaction attempt: ${i + 1}/${this.config.maxBuyRetries}`,
-          );
-          const tokenOut = new Token(TOKEN_PROGRAM_ID, poolKeys.baseMint, poolKeys.baseDecimals);
-          const result = await this.swap(
-            poolKeys,
-            this.config.quoteAta,
-            mintAta,
-            this.config.quoteToken,
-            tokenOut,
-            this.config.quoteAmount,
-            this.config.buySlippage,
-            this.config.wallet,
-            'buy',
-          );
+        const url = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippage}`;
+        
+        const response = await fetch(url, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
 
-          if (result.confirmed) {
-            logger.info(
-              {
-                mint: poolState.baseMint.toString(),
-                signature: result.signature,
-                url: `https://solscan.io/tx/${result.signature}?cluster=${NETWORK}`,
-              },
-              `Confirmed buy tx`,
-            );
-            break;
-          }
-
-          logger.info(
-            {
-              mint: poolState.baseMint.toString(),
-              signature: result.signature,
-              error: result.error,
-            },
-            `Error confirming buy tx`,
-          );
-        } catch (error) {
-          logger.debug({ mint: poolState.baseMint.toString(), error }, `Error confirming buy transaction`);
+        if (!response.ok) {
+            const errorText = await response.text();
+            logger.error('Jupiter quote failed', {
+                status: response.status,
+                statusText: response.statusText,
+                error: errorText
+            });
+            return null;
         }
-      }
+
+        const quoteData = await response.json();
+
+        // Validate quote data
+        if (!quoteData || !quoteData.swapTransaction) {
+            logger.error('Invalid quote response', { quoteData });
+            return null;
+        }
+
+        logger.debug('Quote received successfully', {
+            routes: quoteData.routePlan?.length || 0,
+            priceImpact: quoteData.priceImpactPct
+        });
+
+        return {
+            data: quoteData
+        };
+
     } catch (error) {
-      logger.error({ mint: poolState.baseMint.toString(), error }, `Failed to buy token`);
+        logger.error('Error fetching quote', {
+            error: error instanceof Error ? error.message : String(error),
+            inputMint,
+            outputMint
+        });
+        return null;
     }
   }
 
-  private async fetchPoolInfo(poolKeys: LiquidityPoolKeysV4) {
-    // Get all pool data with individual requests instead of batching
-    const [baseVault, quoteVault, lpVault] = await Promise.all([
-      this.connection.getAccountInfo(poolKeys.baseVault),
-      this.connection.getAccountInfo(poolKeys.quoteVault),
-      this.connection.getAccountInfo(poolKeys.lpVault)
-    ]);
+  private async executeSwap(swapTransaction: string): Promise<{ confirmed: boolean; signature: string; error?: string }> {
+    try {
+        // Decode and deserialize the transaction
+        const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+        const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
 
-    return {
-      status: new BN(1),
-      baseDecimals: poolKeys.baseDecimals,
-      quoteDecimals: poolKeys.quoteDecimals,
-      lpDecimals: poolKeys.lpDecimals,
-      baseReserve: new BN(baseVault?.data ?? 0),
-      quoteReserve: new BN(quoteVault?.data ?? 0),
-      lpSupply: new BN(lpVault?.data ?? 0),
-      baseVault,
-      quoteVault,
-      startTime: new BN(0)
-    };
-  }
+        // Sign the transaction with our wallet
+        transaction.sign([this.config.wallet]);
 
-  private async swap(
-    poolKeys: LiquidityPoolKeysV4,
-    ataIn: PublicKey,
-    ataOut: PublicKey,
-    tokenIn: Token,
-    tokenOut: Token,
-    amountIn: TokenAmount,
-    slippage: number,
-    wallet: Keypair,
-    direction: 'buy' | 'sell',
-  ) {
-    const slippagePercent = new Percent(slippage, 100);
-    const poolInfo = await this.fetchPoolInfo(poolKeys);
+        logger.debug('Executing transaction...');
+        
+        // Get the latest blockhash
+        const latestBlockHash = await this.connection.getLatestBlockhash();
 
-    const computedAmountOut = Liquidity.computeAmountOut({
-      poolKeys,
-      poolInfo,
-      amountIn,
-      currencyOut: tokenOut,
-      slippage: slippagePercent,
-    });
+        // Send the transaction
+        const rawTransaction = transaction.serialize();
+        const signature = await this.connection.sendRawTransaction(rawTransaction, {
+            skipPreflight: true,
+            maxRetries: 2
+        });
 
-    const latestBlockhash = await this.connection.getLatestBlockhash();
-    const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
-      {
-        poolKeys: poolKeys,
-        userKeys: {
-          tokenAccountIn: ataIn,
-          tokenAccountOut: ataOut,
-          owner: wallet.publicKey,
-        },
-        amountIn: amountIn.raw,
-        minAmountOut: computedAmountOut.minAmountOut.raw,
-      },
-      poolKeys.version,
-    );
+        logger.debug('Confirming transaction...', { signature });
 
-    const messageV0 = new TransactionMessage({
-      payerKey: wallet.publicKey,
-      recentBlockhash: latestBlockhash.blockhash,
-      instructions: [
-        ...(this.isWarp || this.isJito
-          ? []
-          : [
-              ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.unitPrice }),
-              ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.unitLimit }),
-            ]),
-        ...(direction === 'buy'
-          ? [
-              createAssociatedTokenAccountIdempotentInstruction(
-                wallet.publicKey,
-                ataOut,
-                wallet.publicKey,
-                tokenOut.mint,
-              ),
-            ]
-          : []),
-        ...innerTransaction.instructions,
-        ...(direction === 'sell' ? [createCloseAccountInstruction(ataIn, wallet.publicKey, wallet.publicKey)] : []),
-      ],
-    }).compileToV0Message();
+        // Wait for confirmation
+        const confirmation = await this.connection.confirmTransaction({
+            blockhash: latestBlockHash.blockhash,
+            lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
+            signature
+        });
 
-    const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([wallet, ...innerTransaction.signers]);
+        if (confirmation.value.err) {
+            logger.error('Transaction confirmed but failed', {
+                error: confirmation.value.err,
+                signature
+            });
+            return {
+                confirmed: false,
+                signature,
+                error: JSON.stringify(confirmation.value.err)
+            };
+        }
 
-    return this.txExecutor.executeAndConfirm(transaction, wallet, latestBlockhash);
+        return {
+            confirmed: true,
+            signature
+        };
+
+    } catch (error) {
+        logger.error('Error executing swap', {
+            error: error instanceof Error ? error.message : String(error)
+        });
+        return {
+            confirmed: false,
+            signature: '',
+            error: String(error)
+        };
+    }
   }
 }

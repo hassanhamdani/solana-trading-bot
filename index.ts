@@ -1,7 +1,6 @@
 import { Connection } from '@solana/web3.js';
 import { Bot, BotConfig } from './bot';
 import { DefaultTransactionExecutor } from './transactions';
-import { MarketCache, PoolCache } from './cache';
 import {
   getToken,
   getWallet,
@@ -15,8 +14,6 @@ import {
   PRIVATE_KEY,
   MAX_BUY_RETRIES,
   AUTO_BUY_DELAY,
-  COMPUTE_UNIT_LIMIT,
-  COMPUTE_UNIT_PRICE,
   BUY_SLIPPAGE,
 } from './helpers';
 import { getAssociatedTokenAddressSync } from '@solana/spl-token';
@@ -26,37 +23,37 @@ import { WalletCopier } from './wallet-copier';
 const connection = new Connection(RPC_ENDPOINT, {
   wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
   commitment: COMMITMENT_LEVEL,
+  confirmTransactionInitialTimeout: 60000,
+  httpHeaders: {
+    'Cache-Control': 'no-cache',
+  },
 });
 
 const runCopyTrader = async () => {
   logger.level = LOG_LEVEL;
   logger.info('Copy trader is starting...');
 
-  const marketCache = new MarketCache(connection);
-  const poolCache = new PoolCache();
   const txExecutor = new DefaultTransactionExecutor(connection);
-
   const wallet = getWallet(PRIVATE_KEY.trim());
   const quoteToken = getToken(QUOTE_MINT);
   
-  // Minimal configuration for copy trading only
-  const botConfig = <BotConfig>{
+  const botConfig: BotConfig = {
     wallet,
     quoteAta: getAssociatedTokenAddressSync(quoteToken.mint, wallet.publicKey),
     quoteToken,
     quoteAmount: new TokenAmount(quoteToken, QUOTE_AMOUNT, false),
     maxBuyRetries: MAX_BUY_RETRIES,
     autoBuyDelay: AUTO_BUY_DELAY,
-    unitLimit: COMPUTE_UNIT_LIMIT,
-    unitPrice: COMPUTE_UNIT_PRICE,
     buySlippage: BUY_SLIPPAGE,
-    // Disable all filters and checks
-    filterCheckInterval: 0,
-    filterCheckDuration: 0,
-    consecutiveMatchCount: 1
   };
 
-  const bot = new Bot(connection, marketCache, poolCache, txExecutor, botConfig);
+  const bot = new Bot(connection, txExecutor, botConfig);
+
+  // Validate wallet before starting
+  if (!await bot.validate()) {
+    logger.error('Wallet validation failed. Exiting...');
+    process.exit(1);
+  }
 
   logger.info('------- CONFIGURATION -------');
   logger.info(`Wallet: ${wallet.publicKey.toString()}`);
