@@ -1,300 +1,203 @@
-import {
-  Connection,
-  Keypair,
-  PublicKey,
-  VersionedTransaction,
-} from '@solana/web3.js';
-import { Token, TokenAmount } from '@raydium-io/raydium-sdk';
+import { Connection, PublicKey, Keypair, VersionedTransaction } from '@solana/web3.js';
 import { logger } from './helpers';
-import { TransactionExecutor } from './transactions';
-import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
-import { JitoTransactionExecutor } from './transactions/jito-rpc-transaction-executor';
-import { NATIVE_MINT } from '@solana/spl-token';
-import axios from 'axios';
+import { SwapTracker } from './wallet-copier';
+import fetch from 'cross-fetch';
 
-export interface BotConfig {
-  wallet: Keypair;
-  quoteToken: Token;
-  quoteAmount: TokenAmount;
-  quoteAta: PublicKey;
-  autoBuyDelay: number;
-  maxBuyRetries: number;
-  buySlippage: number;
+interface TradeDetails {
+    tokenIn: {
+        mint: string;
+        amount: number;
+    };
+    tokenOut: {
+        mint: string;
+        amount: number;
+    };
+    signature: string;
+    blockhash: string;
+    computeUnits: number;
 }
 
-interface JupiterQuoteResponse {
-  inputMint: string;
-  outputMint: string;
-  amount: string;
-  otherAmountThreshold: string;
-  swapMode: string;
-  slippageBps: number;
-  platformFee: unknown;
-  priceImpactPct: string;
-  routePlan: unknown[];
-  contextSlot: number;
-  timeTaken: number;
-}
+export class CopyTradingBot {
+    private connection: Connection;
+    private targetWallet: string;
+    private userWallet: Keypair;
+    private swapTracker: SwapTracker;
+    private isRunning: boolean = false;
+    private readonly WSOL_MINT = 'So11111111111111111111111111111111111111112';
+    private readonly JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6';
+    private readonly slippagePercentage = Number(process.env.BUY_SLIPPAGE) || 20; // 20% default slippage for memecoins
+    private readonly computeUnitLimit = Number(process.env.COMPUTE_UNIT_LIMIT) || 101337;
+    private readonly computeUnitPrice = Number(process.env.COMPUTE_UNIT_PRICE) || 421197;
 
-const JUPITER_RATE_LIMIT = 2000; // 2 seconds between requests
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000; // 1 second
-
-export class Bot {
-  public readonly isWarp: boolean = false;
-  public readonly isJito: boolean = false;
-  private lastJupiterRequest = 0;
-  private readonly jupiterClient = axios.create({
-    baseURL: 'https://quote-api.jup.ag/v6',
-    timeout: 10000
-  });
-
-  constructor(
-    private readonly connection: Connection,
-    private readonly txExecutor: TransactionExecutor,
-    readonly config: BotConfig,
-  ) {
-    this.isWarp = txExecutor instanceof WarpTransactionExecutor;
-    this.isJito = txExecutor instanceof JitoTransactionExecutor;
-  }
-
-  async validate() {
-    try {
-      const balance = await this.connection.getBalance(this.config.wallet.publicKey);
-      if (balance <= 0) {
-        logger.error(`Insufficient SOL balance in wallet: ${this.config.wallet.publicKey.toString()}`);
-        return false;
-      }
-      return true;
-    } catch (error) {
-      logger.error(`Failed to validate wallet: ${error instanceof Error ? error.message : String(error)}`);
-      return false;
-    }
-  }
-
-  private async fetchWithRetry(url: string, options?: RequestInit) {
-    for (let i = 0; i < MAX_RETRIES; i++) {
-      try {
-        // Rate limiting for Jupiter API
-        const now = Date.now();
-        const timeSinceLastRequest = now - this.lastJupiterRequest;
-        if (timeSinceLastRequest < JUPITER_RATE_LIMIT) {
-          await new Promise(resolve => setTimeout(resolve, JUPITER_RATE_LIMIT - timeSinceLastRequest));
-        }
-        this.lastJupiterRequest = Date.now();
-
-        const response = await fetch(url, options);
-        if (response.status === 429) {
-          const retryAfter = response.headers.get('retry-after');
-          const delay = retryAfter ? parseInt(retryAfter) * 1000 : RETRY_DELAY * (i + 1);
-          logger.debug(`Rate limited by Jupiter. Retrying after ${delay}ms...`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          continue;
-        }
-        return response;
-      } catch (error) {
-        if (i === MAX_RETRIES - 1) throw error;
-        logger.debug(`Request failed, retrying... (${error instanceof Error ? error.message : String(error)})`);
-        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (i + 1)));
-      }
-    }
-    throw new Error('Max retries reached');
-  }
-
-  public async buy(mint: PublicKey) {
-    try {
-        // Add validation
-        if (!mint) {
-            logger.error('Invalid mint address provided');
-            return { confirmed: false, error: 'Invalid mint' };
-        }
-
-        // Add delay before buy
-        logger.debug(`Waiting for ${this.config.autoBuyDelay} ms before buy`, { mint: mint.toString() });
-        await new Promise(resolve => setTimeout(resolve, this.config.autoBuyDelay));
-
-        // Get quote first
-        const quoteResponse = await this.getQuote(mint);
-        if (!quoteResponse || !quoteResponse.data) {
-            logger.error('Failed to get quote', { mint: mint.toString() });
-            return { confirmed: false, error: 'Quote failed' };
-        }
-
-        // Validate quote data
-        const { data } = quoteResponse;
-        if (!data.swapTransaction) {
-            logger.error('No swap transaction in quote', { mint: mint.toString() });
-            return { confirmed: false, error: 'Invalid quote' };
-        }
-
-        // Execute the swap
-        logger.debug('Executing transaction...', { mint: mint.toString() });
-        const swapResult = await this.executeSwap(data.swapTransaction);
-
-        if (swapResult.confirmed) {
-            logger.info('Buy transaction confirmed', { 
-                mint: mint.toString(),
-                signature: swapResult.signature 
-            });
-        } else {
-            logger.error('Buy transaction failed', { 
-                mint: mint.toString(),
-                error: swapResult.error 
-            });
-        }
-
-        return swapResult;
-
-    } catch (error) {
-        logger.error('Error in buy function', {
-            mint: mint?.toString(),
-            error: error instanceof Error ? error.message : String(error)
-        });
-        return { confirmed: false, error: String(error) };
-    }
-  }
-
-  private async getQuote(mint: PublicKey): Promise<any> {
-    const inputMint = NATIVE_MINT.toString();
-    const outputMint = mint.toString();
-    const minAmount = 1_000_000;
-    const amount = Math.max(minAmount, this.config.quoteAmount.raw.toNumber());
-    const slippage = this.config.buySlippage;
-
-    try {
-        logger.info('Preparing quote request:', {
-            inputMint,
-            outputMint,
-            amount: amount.toString(),
-            slippage,
-            amountInSOL: amount / 1e9
-        });
-
-        const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippage}`;
-        logger.info('Requesting quote from:', { url: quoteUrl });
-
-        const quoteResponse = await this.fetchWithRetry(quoteUrl);
-        const quoteData = await quoteResponse.json();
-
-        console.log('Full Quote Response:', JSON.stringify(quoteData, null, 2));
-
-        // Prepare swap request - Remove prioritizationFeeLamports
-        const swapRequestBody = {
-            quoteResponse: quoteData,
-            userPublicKey: this.config.wallet.publicKey.toString(),
-            wrapAndUnwrapSol: true,
-            computeUnitPriceMicroLamports: 1000,  // Keep only this one
-            // prioritizationFeeLamports: 1000,    // Remove this
-            slippageBps: slippage,
-            strict: false
-        };
-
-        console.log('Swap Request Body:', JSON.stringify(swapRequestBody, null, 2));
-
-        const swapResponse = await this.fetchWithRetry('https://quote-api.jup.ag/v6/swap', {
-            method: 'POST',
-            headers: { 
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(swapRequestBody)
-        });
+    constructor(
+        connection: Connection,
+        targetWallet: string,
+        privateKey: string
+    ) {
+        this.connection = connection;
+        this.targetWallet = targetWallet;
+        this.userWallet = Keypair.fromSecretKey(Buffer.from(privateKey, 'hex'));
+        this.swapTracker = new SwapTracker(connection, targetWallet);
         
-        const swapData = await swapResponse.json();
-        
-        // Log the complete swap response
-        console.log('Complete Swap Response:', JSON.stringify(swapData, null, 2));
-        
-        logger.info('Swap Response:', { 
-            status: swapResponse.status,
-            hasSwapTransaction: !!swapData.swapTransaction,
-            error: swapData.error,
-            message: swapData.message,
-            responseKeys: Object.keys(swapData)
-        });
+        // Bind the trade handler to this instance
+        this.handleTrade = this.handleTrade.bind(this);
+    }
 
-        if (!swapData.swapTransaction) {
-            logger.error('No swap transaction in response', { 
-                status: swapResponse.status,
-                error: swapData.error,
-                message: swapData.message,
-                data: swapData
-            });
+    private async getJupiterQuote(inputMint: string, outputMint: string, amount: number): Promise<any> {
+        try {
+            const endpoint = `${this.JUPITER_QUOTE_API}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${this.slippagePercentage * 100}`;
+            const response = await fetch(endpoint);
+            const data = await response.json();
+            return data;
+        } catch (error) {
+            logger.error(`Error getting Jupiter quote: ${error}`);
             return null;
         }
-
-        return { data: swapData };
-
-    } catch (error) {
-        logger.error('Error in getQuote:', {
-            error: error instanceof Error ? error.message : String(error),
-            stack: error instanceof Error ? error.stack : undefined,
-            params: {
-                inputMint,
-                outputMint,
-                amount,
-                slippage
-            }
-        });
-        return null;
     }
-  }
 
-  private async executeSwap(swapTransaction: string): Promise<{ confirmed: boolean; signature: string; error?: string }> {
-    try {
-        // Decode and deserialize the transaction
-        const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-        const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+    private async executeJupiterSwap(quoteResponse: any): Promise<string | null> {
+        try {
+            // Get swap transaction
+            const { swapTransaction } = await (
+                await fetch(`${this.JUPITER_QUOTE_API}/swap`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        quoteResponse,
+                        userPublicKey: this.userWallet.publicKey.toString(),
+                        wrapAndUnwrapSol: true,
+                        computeUnitPriceMicroLamports: this.computeUnitPrice,
+                        dynamicComputeUnitLimit: true,
+                        prioritizationFeeLamports: 'auto'
+                    })
+                })
+            ).json();
 
-        // Sign the transaction with our wallet
-        transaction.sign([this.config.wallet]);
+            // Deserialize and sign transaction
+            const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+            const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+            transaction.sign([this.userWallet]);
 
-        logger.debug('Executing transaction...');
-        
-        // Get the latest blockhash
-        const latestBlockHash = await this.connection.getLatestBlockhash();
+            // Send transaction
+            const rawTransaction = transaction.serialize();
+            const signature = await this.connection.sendRawTransaction(rawTransaction, {
+                skipPreflight: true,
+                maxRetries: 2
+            });
 
-        // Send the transaction
-        const rawTransaction = transaction.serialize();
-        const signature = await this.connection.sendRawTransaction(rawTransaction, {
-            skipPreflight: true,
-            maxRetries: 2
-        });
-
-        logger.debug('Confirming transaction...', { signature });
-
-        // Wait for confirmation
-        const confirmation = await this.connection.confirmTransaction({
-            blockhash: latestBlockHash.blockhash,
-            lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
-            signature
-        });
-
-        if (confirmation.value.err) {
-            logger.error('Transaction confirmed but failed', {
-                error: confirmation.value.err,
+            // Wait for confirmation
+            const latestBlockHash = await this.connection.getLatestBlockhash();
+            await this.connection.confirmTransaction({
+                blockhash: latestBlockHash.blockhash,
+                lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
                 signature
             });
-            return {
-                confirmed: false,
-                signature,
-                error: JSON.stringify(confirmation.value.err)
-            };
+
+            return signature;
+
+        } catch (error) {
+            logger.error(`Error executing Jupiter swap: ${error}`);
+            return null;
         }
-
-        return {
-            confirmed: true,
-            signature
-        };
-
-    } catch (error) {
-        logger.error('Error executing swap', {
-            error: error instanceof Error ? error.message : String(error)
-        });
-        return {
-            confirmed: false,
-            signature: '',
-            error: String(error)
-        };
     }
-  }
+
+    private async handleTrade(tx: TradeDetails) {
+        try {
+            logger.info(`🔄 Copying trade from transaction: ${tx.signature}`);
+            
+            // Convert amount to lamports/raw amount (multiply by 10^decimals)
+            // Note: You'll need to get token decimals from token metadata
+            const inputAmount = tx.tokenIn.amount;
+
+            // Get Jupiter quote
+            const quoteResponse = await this.getJupiterQuote(
+                tx.tokenIn.mint,
+                tx.tokenOut.mint,
+                inputAmount
+            );
+
+            if (!quoteResponse) {
+                logger.error('Failed to get Jupiter quote');
+                return;
+            }
+
+            logger.info('Got Jupiter quote:', {
+                inputAmount: quoteResponse.inputAmount,
+                outputAmount: quoteResponse.outputAmount,
+                priceImpact: quoteResponse.priceImpact,
+                platformFee: quoteResponse.platformFee
+            });
+
+            // Execute the swap
+            const swapSignature = await this.executeJupiterSwap(quoteResponse);
+            
+            if (swapSignature) {
+                logger.info(`✅ Successfully copied trade!`);
+                logger.info(`Transaction signature: ${swapSignature}`);
+                logger.info(`Solscan: https://solscan.io/tx/${swapSignature}`);
+            } else {
+                logger.error('Failed to execute swap');
+            }
+
+        } catch (error) {
+            logger.error(`❌ Error copying trade: ${error}`);
+        }
+    }
+
+    private parseTrade(txData: any): TradeDetails | null {
+        try {
+            // Extract token changes
+            const tokenChanges = txData.meta.postTokenBalances.map((post: any) => {
+                const pre = txData.meta.preTokenBalances.find(
+                    (pre: any) => pre.mint === post.mint
+                );
+                return {
+                    mint: post.mint,
+                    change: (post.uiTokenAmount.uiAmount || 0) - (pre?.uiTokenAmount.uiAmount || 0)
+                };
+            });
+
+            // Find the tokens involved in the swap
+            const tokenIn = tokenChanges.find((t: any) => t.change < 0);
+            const tokenOut = tokenChanges.find((t: any) => t.change > 0);
+
+            if (!tokenIn || !tokenOut) return null;
+
+            return {
+                tokenIn: {
+                    mint: tokenIn.mint,
+                    amount: Math.abs(tokenIn.change)
+                },
+                tokenOut: {
+                    mint: tokenOut.mint,
+                    amount: tokenOut.change
+                },
+                signature: txData.transaction.signatures[0],
+                blockhash: txData.transaction.message.recentBlockhash,
+                computeUnits: txData.meta.computeUnitsConsumed
+            };
+        } catch (error) {
+            logger.error(`Error parsing trade: ${error}`);
+            return null;
+        }
+    }
+
+    async start() {
+        this.isRunning = true;
+        logger.info(`🤖 Starting copy trading bot...`);
+        logger.info(`Target wallet: ${this.targetWallet}`);
+        logger.info(`Your wallet: ${this.userWallet.publicKey.toString()}`);
+
+        // Subscribe to the SwapTracker's events
+        // TODO: Implement event emitter in SwapTracker to notify about new trades
+        await this.swapTracker.trackSwaps();
+    }
+
+    stop() {
+        this.isRunning = false;
+        this.swapTracker.stop();
+        logger.info(`🛑 Stopping copy trading bot...`);
+    }
 }
