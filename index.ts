@@ -1,6 +1,7 @@
 import { Connection } from '@solana/web3.js';
 import { logger, COMMITMENT_LEVEL, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT, LOG_LEVEL } from './helpers';
 import { SwapTracker } from './wallet-copier';
+import { CopyTradingBot as Bot } from './bot';
 
 const connection = new Connection(RPC_ENDPOINT, {
     wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
@@ -18,7 +19,9 @@ const runSwapTracker = async () => {
     const walletToTrack = '5iywveQKkidqPDKt2CExJcWKex2EXz9kbGcYiZvhuXWs';
     logger.info(`Starting to track wallet: ${walletToTrack}`);
 
-    const tracker = new SwapTracker(connection, walletToTrack);
+    const privateKey = process.env.PRIVATE_KEY || '';
+    const bot = new Bot(connection, walletToTrack, privateKey);
+    const tracker = new SwapTracker(connection, walletToTrack, bot);
     await tracker.trackSwaps();
 
     logger.info('Swap tracker is running! Press CTRL + C to stop it.');

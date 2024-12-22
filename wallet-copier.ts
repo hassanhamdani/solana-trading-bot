@@ -1,5 +1,6 @@
 import { Connection, PublicKey, VersionedTransactionResponse, TransactionResponse } from '@solana/web3.js';
 import { logger } from './helpers';
+import { CopyTradingBot, TradeDetails } from './bot';
 
 interface TokenBalance {
     mint: string;
@@ -14,10 +15,12 @@ export class SwapTracker {
     private isTracking: boolean = false;
     private lastProcessedTime: number = 0;
     private readonly RATE_LIMIT_DELAY = 500;
+    private bot: CopyTradingBot;
 
-    constructor(connection: Connection, walletAddress: string) {
+    constructor(connection: Connection, walletAddress: string, bot: CopyTradingBot) {
         this.connection = connection;
         this.walletAddress = walletAddress;
+        this.bot = bot;
     }
 
     private parseTokenBalances(balance: any): TokenBalance | null {
@@ -87,6 +90,39 @@ export class SwapTracker {
         logger.info(`Recent Blockhash: ${tx.transaction.message.recentBlockhash}`);
         logger.info(`Compute Units: ${tx.meta.computeUnitsConsumed}`);
         
+        // Prepare trade details and call the bot
+        if (preTokenBalances.length > 0 && postTokenBalances.length > 0) {
+            const tokenChanges = postTokenBalances.map(post => {
+                const pre = preTokenBalances.find(p => p?.mint === post?.mint);
+                return {
+                    mint: post?.mint,
+                    change: (post?.uiAmount || 0) - (pre?.uiAmount || 0)
+                };
+            });
+
+            const tokenIn = tokenChanges.find(t => t.change < 0);
+            const tokenOut = tokenChanges.find(t => t.change > 0);
+
+            if (tokenIn && tokenOut) {
+                const tradeDetails: TradeDetails = {
+                    tokenIn: {
+                        mint: tokenIn.mint!,
+                        amount: Math.abs(tokenIn.change)
+                    },
+                    tokenOut: {
+                        mint: tokenOut.mint!,
+                        amount: tokenOut.change
+                    },
+                    signature: tx.transaction.signatures[0],
+                    blockhash: tx.transaction.message.recentBlockhash,
+                    computeUnits: tx.meta.computeUnitsConsumed || 0
+                };
+
+                // Call the bot's handleTrade method
+                await this.bot.handleTrade(tradeDetails);
+            }
+        }
+
         logger.info('------------------------\n');
     }
 

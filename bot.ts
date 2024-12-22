@@ -3,7 +3,8 @@ import { logger } from './helpers';
 import { SwapTracker } from './wallet-copier';
 import fetch from 'cross-fetch';
 
-interface TradeDetails {
+
+export interface TradeDetails {
     tokenIn: {
         mint: string;
         amount: number;
@@ -36,8 +37,11 @@ export class CopyTradingBot {
     ) {
         this.connection = connection;
         this.targetWallet = targetWallet;
-        this.userWallet = Keypair.fromSecretKey(Buffer.from(privateKey, 'hex'));
-        this.swapTracker = new SwapTracker(connection, targetWallet);
+        // Convert base58 private key to Uint8Array
+        const bs58 = require('bs58');
+        const decodedKey = bs58.decode(privateKey);
+        this.userWallet = Keypair.fromSecretKey(decodedKey);
+        this.swapTracker = new SwapTracker(connection, targetWallet, this);
         
         // Bind the trade handler to this instance
         this.handleTrade = this.handleTrade.bind(this);
@@ -103,7 +107,7 @@ export class CopyTradingBot {
         }
     }
 
-    private async handleTrade(tx: TradeDetails) {
+    public async handleTrade(tx: TradeDetails) {
         try {
             logger.info(`🔄 Copying trade from transaction: ${tx.signature}`);
             
@@ -190,13 +194,14 @@ export class CopyTradingBot {
         logger.info(`Target wallet: ${this.targetWallet}`);
         logger.info(`Your wallet: ${this.userWallet.publicKey.toString()}`);
 
-        // Subscribe to the SwapTracker's events
-        // TODO: Implement event emitter in SwapTracker to notify about new trades
+
+        // Start tracking swaps
         await this.swapTracker.trackSwaps();
     }
 
     stop() {
         this.isRunning = false;
+        // Remove event listener
         this.swapTracker.stop();
         logger.info(`🛑 Stopping copy trading bot...`);
     }
