@@ -65,24 +65,8 @@ export class SwapTracker {
                 return null;
             }
 
-            // Find the Raydium instruction
-            const raydiumInstruction = message.compiledInstructions.find(
-                ix => {
-                    const programId = message.staticAccountKeys[ix.programIdIndex];
-                    return programId && programId.toString() === raydiumV4ProgramId;
-                }
-            );
-
-            if (!raydiumInstruction) {
-                logger.error('No Raydium V4 instruction found in transaction');
-                return null;
-            }
 
             const staticAccounts = message.staticAccountKeys;
-            if (!staticAccounts || staticAccounts.length < 25) {
-                logger.error('Invalid static accounts array');
-                return null;
-            }
 
             // Safely create PublicKeys with validation
             const createSafePublicKey = (account: any, label: string): PublicKey | null => {

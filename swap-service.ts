@@ -227,6 +227,7 @@ export class SwapService {
         try {
             logger.info(`Attempting swap: ${tokenInMint} -> ${tokenOutMint}, amount: ${amountIn}`);
             
+            
             const tokenInPubkey = new PublicKey(tokenInMint);
             const tokenOutPubkey = new PublicKey(tokenOutMint);
 
@@ -247,6 +248,32 @@ export class SwapService {
                 userDestTokenAccount: userTokenAccountOut,       // Token account for output token
                 userAuthority: this.userWallet.publicKey        // Your wallet's public key
             };
+
+            logger.info('Static Accounts Array:');
+            const accountsArray = [
+                { name: 'ammId', pubkey: accounts.ammId },
+                { name: 'ammAuthority', pubkey: accounts.ammAuthority },
+                { name: 'ammOpenOrders', pubkey: accounts.ammOpenOrders },
+                { name: 'ammTargetOrders', pubkey: accounts.ammTargetOrders },
+                { name: 'poolCoinTokenAccount', pubkey: accounts.poolCoinTokenAccount },
+                { name: 'poolPcTokenAccount', pubkey: accounts.poolPcTokenAccount },
+                { name: 'serumProgramId', pubkey: accounts.serumProgramId },
+                { name: 'serumMarket', pubkey: accounts.serumMarket },
+                { name: 'serumBids', pubkey: accounts.serumBids },
+                { name: 'serumAsks', pubkey: accounts.serumAsks },
+                { name: 'serumEventQueue', pubkey: accounts.serumEventQueue },
+                { name: 'serumCoinVaultAccount', pubkey: accounts.serumCoinVaultAccount },
+                { name: 'serumPcVaultAccount', pubkey: accounts.serumPcVaultAccount },
+                { name: 'serumVaultSigner', pubkey: accounts.serumVaultSigner },
+                { name: 'userSourceTokenAccount', pubkey: accounts.userSourceTokenAccount },
+                { name: 'userDestTokenAccount', pubkey: accounts.userDestTokenAccount },
+                { name: 'userAuthority', pubkey: accounts.userAuthority },
+                { name: 'tokenProgramId', pubkey: TOKEN_PROGRAM_ID }
+            ];
+
+            accountsArray.forEach((account, index) => {
+                logger.info(`${index}: ${account.name} = ${account.pubkey.toString()}`);
+            });
 
             // Create Raydium V4 swap instruction
             const swapIx = new TransactionInstruction({
