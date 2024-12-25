@@ -1,12 +1,33 @@
 import { Connection, PublicKey, VersionedTransactionResponse, TransactionResponse } from '@solana/web3.js';
 import { logger } from './helpers';
 import { CopyTradingBot, TradeDetails } from './bot';
+import { promises as fs } from 'fs';
 
 interface TokenBalance {
     mint: string;
     amount: string;
     decimals: number;
     uiAmount: number;
+}
+
+interface RaydiumV4Accounts {
+    ammId: PublicKey;
+    ammAuthority: PublicKey;
+    ammOpenOrders: PublicKey;
+    ammTargetOrders: PublicKey;
+    poolCoinTokenAccount: PublicKey;
+    poolPcTokenAccount: PublicKey;
+    serumProgramId: PublicKey;
+    serumMarket: PublicKey;
+    serumBids: PublicKey;
+    serumAsks: PublicKey;
+    serumEventQueue: PublicKey;
+    serumCoinVaultAccount: PublicKey;
+    serumPcVaultAccount: PublicKey;
+    serumVaultSigner: PublicKey;
+    userSourceTokenAccount: PublicKey | undefined;
+    userDestTokenAccount: PublicKey | undefined;
+    userAuthority: PublicKey | undefined;
 }
 
 export class SwapTracker {
@@ -33,14 +54,125 @@ export class SwapTracker {
         };
     }
 
+    private extractRaydiumV4Accounts(tx: TransactionResponse | VersionedTransactionResponse): RaydiumV4Accounts | null {
+        try {
+            const raydiumV4ProgramId = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+            
+            // Safely access message and instructions
+            const message = tx.transaction?.message;
+            if (!message || !message.compiledInstructions) {
+                logger.error('Transaction message or compiled instructions not found');
+                return null;
+            }
+
+            // Find the Raydium instruction
+            const raydiumInstruction = message.compiledInstructions.find(
+                ix => {
+                    const programId = message.staticAccountKeys[ix.programIdIndex];
+                    return programId && programId.toString() === raydiumV4ProgramId;
+                }
+            );
+
+            if (!raydiumInstruction) {
+                logger.error('No Raydium V4 instruction found in transaction');
+                return null;
+            }
+
+            const staticAccounts = message.staticAccountKeys;
+            if (!staticAccounts || staticAccounts.length < 25) {
+                logger.error('Invalid static accounts array');
+                return null;
+            }
+
+            // Safely create PublicKeys with validation
+            const createSafePublicKey = (account: any, label: string): PublicKey | null => {
+                try {
+                    if (!account) {
+                        logger.error(`Missing account for ${label}`);
+                        return null;
+                    }
+                    return new PublicKey(account.toString());
+                } catch (error) {
+                    logger.error(`Error creating PublicKey for ${label}: ${error}`);
+                    return null;
+                }
+            };
+
+            // Create accounts with validation
+            const ammId = createSafePublicKey(staticAccounts[3], 'ammId');
+            const ammAuthority = createSafePublicKey(staticAccounts[22], 'ammAuthority');
+            const ammOpenOrders = createSafePublicKey(staticAccounts[4], 'ammOpenOrders');
+            const ammTargetOrders = createSafePublicKey(staticAccounts[5], 'ammTargetOrders');
+            const poolCoinTokenAccount = createSafePublicKey(staticAccounts[6], 'poolCoinTokenAccount');
+            const poolPcTokenAccount = createSafePublicKey(staticAccounts[7], 'poolPcTokenAccount');
+            const serumProgramId = createSafePublicKey(staticAccounts[23], 'serumProgramId');
+            const serumMarket = createSafePublicKey(staticAccounts[8], 'serumMarket');
+            const serumBids = createSafePublicKey(staticAccounts[9], 'serumBids');
+            const serumAsks = createSafePublicKey(staticAccounts[10], 'serumAsks');
+            const serumEventQueue = createSafePublicKey(staticAccounts[11], 'serumEventQueue');
+            const serumCoinVaultAccount = createSafePublicKey(staticAccounts[12], 'serumCoinVaultAccount');
+            const serumPcVaultAccount = createSafePublicKey(staticAccounts[13], 'serumPcVaultAccount');
+            const serumVaultSigner = createSafePublicKey(staticAccounts[24], 'serumVaultSigner');
+
+            // Verify all required accounts are present
+            if (!ammId || !ammAuthority || !ammOpenOrders || !ammTargetOrders || 
+                !poolCoinTokenAccount || !poolPcTokenAccount || !serumProgramId || 
+                !serumMarket || !serumBids || !serumAsks || !serumEventQueue || 
+                !serumCoinVaultAccount || !serumPcVaultAccount || !serumVaultSigner) {
+                logger.error('One or more required accounts are missing');
+                return null;
+            }
+
+            return {
+                ammId,
+                ammAuthority,
+                ammOpenOrders,
+                ammTargetOrders,
+                poolCoinTokenAccount,
+                poolPcTokenAccount,
+                serumProgramId,
+                serumMarket,
+                serumBids,
+                serumAsks,
+                serumEventQueue,
+                serumCoinVaultAccount,
+                serumPcVaultAccount,
+                serumVaultSigner,
+                userSourceTokenAccount: undefined,
+                userDestTokenAccount: undefined,
+                userAuthority: undefined,
+            };
+
+        } catch (error) {
+            logger.error(`Error extracting Raydium V4 accounts: ${error}`);
+            if (error instanceof Error) {
+                logger.error(`Stack trace: ${error.stack}`);
+            }
+            return null;
+        }
+    }
+
     private async analyzeTransaction(tx: TransactionResponse | VersionedTransactionResponse) {
         if (!tx.meta) return;
 
-        // Extract key transaction details
         const signature = tx.transaction.signatures[0];
         const timestamp = tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleString() : 'Unknown';
-        
-        // Get token balance changes
+
+        // Create log object
+        const logData = {
+            signature,
+            timestamp,
+            allLogs: tx.meta.logMessages,
+            preTokenBalances: tx.meta.preTokenBalances,
+            postTokenBalances: tx.meta.postTokenBalances,
+            rawTransaction: tx
+        };
+
+        // Save complete log to file
+        const logFileName = `swap-${signature}.json`;
+        await fs.writeFile(logFileName, JSON.stringify(logData, null, 2));
+
+        // Continue with existing trade processing logic
         const preTokenBalances = tx.meta.preTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
         const postTokenBalances = tx.meta.postTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
         
@@ -89,18 +221,9 @@ export class SwapTracker {
             const tokenOut = tokenChanges.find(t => t.change > 0);
 
             if (tokenIn && tokenOut) {
-                const raydiumV4ProgramId = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+                const raydiumAccounts = this.extractRaydiumV4Accounts(tx);
                 
-                // Find Raydium instruction (index 2 in this case based on the log)
-                const raydiumInstruction = tx.transaction.message.compiledInstructions.find(
-                    ix => tx.transaction.message.staticAccountKeys[ix.programIdIndex].toString() === raydiumV4ProgramId
-                );
-
-                if (raydiumInstruction) {
-                    // The pool address is the second account in the instruction (index 1)
-                    const poolAddress = tx.transaction.message.staticAccountKeys[raydiumInstruction.accountKeyIndexes[1]];
-                    logger.info(`Found Raydium pool address: ${poolAddress.toString()}`);
-
+                if (raydiumAccounts) {
                     const tradeDetails: TradeDetails = {
                         tokenIn: {
                             mint: tokenIn.mint!,
@@ -113,7 +236,8 @@ export class SwapTracker {
                         signature: signature,
                         blockhash: tx.transaction.message.recentBlockhash,
                         computeUnits: tx.meta.computeUnitsConsumed || 0,
-                        poolAddress: poolAddress.toString()  // Add the pool address
+                        poolAddress: raydiumAccounts.ammId.toString(),
+                        raydiumAccounts  // Add the full accounts structure
                     };
 
                     await this.bot.handleTrade(tradeDetails);

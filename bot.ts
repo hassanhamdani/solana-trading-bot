@@ -18,7 +18,28 @@ export interface TradeDetails {
     signature: string;
     blockhash: string;
     computeUnits: number;
-    poolAddress?: string;
+    poolAddress: string;
+    raydiumAccounts: RaydiumV4Accounts;
+}
+
+export interface RaydiumV4Accounts {
+    ammId: PublicKey;
+    ammAuthority: PublicKey;
+    ammOpenOrders: PublicKey;
+    ammTargetOrders: PublicKey;
+    poolCoinTokenAccount: PublicKey;
+    poolPcTokenAccount: PublicKey;
+    serumProgramId: PublicKey;
+    serumMarket: PublicKey;
+    serumBids: PublicKey;
+    serumAsks: PublicKey;
+    serumEventQueue: PublicKey;
+    serumCoinVaultAccount: PublicKey;
+    serumPcVaultAccount: PublicKey;
+    serumVaultSigner: PublicKey;
+    userSourceTokenAccount?: PublicKey | undefined;
+    userDestTokenAccount?: PublicKey | undefined;
+    userAuthority?: PublicKey | undefined;
 }
 
 export class CopyTradingBot {
@@ -85,43 +106,90 @@ export class CopyTradingBot {
         }
     }
 
-    private parseTrade(txData: any): TradeDetails | null {
-        try {
-            // Extract token changes
-            const tokenChanges = txData.meta.postTokenBalances.map((post: any) => {
-                const pre = txData.meta.preTokenBalances.find(
-                    (pre: any) => pre.mint === post.mint
-                );
-                return {
-                    mint: post.mint,
-                    change: (post.uiTokenAmount.uiAmount || 0) - (pre?.uiTokenAmount.uiAmount || 0)
-                };
-            });
+    // private parseTrade(txData: any): TradeDetails | null {
+    //     try {
+    //         // Extract token changes
+    //         const tokenChanges = txData.meta.postTokenBalances.map((post: any) => {
+    //             const pre = txData.meta.preTokenBalances.find(
+    //                 (pre: any) => pre.mint === post.mint
+    //             );
+    //             return {
+    //                 mint: post.mint,
+    //                 change: (post.uiTokenAmount.uiAmount || 0) - (pre?.uiTokenAmount.uiAmount || 0)
+    //             };
+    //         });
 
-            // Find the tokens involved in the swap
-            const tokenIn = tokenChanges.find((t: any) => t.change < 0);
-            const tokenOut = tokenChanges.find((t: any) => t.change > 0);
+    //         // Find the tokens involved in the swap
+    //         const tokenIn = tokenChanges.find((t: any) => t.change < 0);
+    //         const tokenOut = tokenChanges.find((t: any) => t.change > 0);
 
-            if (!tokenIn || !tokenOut) return null;
+    //         if (!tokenIn || !tokenOut) return null;
 
-            return {
-                tokenIn: {
-                    mint: tokenIn.mint,
-                    amount: Math.abs(tokenIn.change)
-                },
-                tokenOut: {
-                    mint: tokenOut.mint,
-                    amount: tokenOut.change
-                },
-                signature: txData.transaction.signatures[0],
-                blockhash: txData.transaction.message.recentBlockhash,
-                computeUnits: txData.meta.computeUnitsConsumed
-            };
-        } catch (error) {
-            logger.error(`Error parsing trade: ${error}`);
-            return null;
-        }
-    }
+    //         // Extract Raydium accounts (you might need to implement this)
+    //         const raydiumAccounts = this.extractRaydiumAccounts(txData);
+    //         if (!raydiumAccounts) return null;
+
+    //         return {
+    //             tokenIn: {
+    //                 mint: tokenIn.mint,
+    //                 amount: Math.abs(tokenIn.change)
+    //             },
+    //             tokenOut: {
+    //                 mint: tokenOut.mint,
+    //                 amount: tokenOut.change
+    //             },
+    //             signature: txData.transaction.signatures[0],
+    //             blockhash: txData.transaction.message.recentBlockhash,
+    //             computeUnits: txData.meta.computeUnitsConsumed,
+    //             poolAddress: raydiumAccounts.ammId.toString(),
+    //             raydiumAccounts
+    //         };
+    //     } catch (error) {
+    //         logger.error(`Error parsing trade: ${error}`);
+    //         return null;
+    //     }
+    // }
+
+    // Add this helper method to extract Raydium accounts
+    // private extractRaydiumAccounts(txData: any): RaydiumV4Accounts | null {
+    //     try {
+    //         const raydiumV4ProgramId = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+            
+    //         // Find the Raydium instruction
+    //         const raydiumInstruction = txData.transaction.message.compiledInstructions.find(
+    //             (ix: any) => txData.transaction.message.staticAccountKeys[ix.programIdIndex].toString() === raydiumV4ProgramId
+    //         );
+
+    //         if (!raydiumInstruction) return null;
+
+    //         // Get the account indexes from the instruction
+    //         const accounts = raydiumInstruction.accountKeyIndexes;
+    //         const staticAccounts = txData.transaction.message.staticAccountKeys;
+
+    //         return {
+    //             ammId: new PublicKey(staticAccounts[accounts[1]]),
+    //             ammAuthority: new PublicKey(staticAccounts[accounts[2]]),
+    //             ammOpenOrders: new PublicKey(staticAccounts[accounts[3]]),
+    //             ammTargetOrders: new PublicKey(staticAccounts[accounts[4]]),
+    //             poolCoinTokenAccount: new PublicKey(staticAccounts[accounts[5]]),
+    //             poolPcTokenAccount: new PublicKey(staticAccounts[accounts[6]]),
+    //             serumProgramId: new PublicKey(staticAccounts[accounts[7]]),
+    //             serumMarket: new PublicKey(staticAccounts[accounts[8]]),
+    //             serumBids: new PublicKey(staticAccounts[accounts[9]]),
+    //             serumAsks: new PublicKey(staticAccounts[accounts[10]]),
+    //             serumEventQueue: new PublicKey(staticAccounts[accounts[11]]),
+    //             serumCoinVaultAccount: new PublicKey(staticAccounts[accounts[12]]),
+    //             serumPcVaultAccount: new PublicKey(staticAccounts[accounts[13]]),
+    //             serumVaultSigner: new PublicKey(staticAccounts[accounts[14]]),
+    //             userSourceTokenAccount: new PublicKey(staticAccounts[accounts[15]]),
+    //             userDestTokenAccount: new PublicKey(staticAccounts[accounts[16]]),
+    //             userAuthority: new PublicKey(staticAccounts[accounts[17]])
+    //         };
+    //     } catch (error) {
+    //         logger.error(`Error extracting Raydium V4 accounts: ${error}`);
+    //         return null;
+    //     }
+    // }
 
     async start() {
         this.isRunning = true;

@@ -3,6 +3,7 @@ import { TOKEN_PROGRAM_ID, createAssociatedTokenAccountInstruction, getAssociate
 import { logger } from './helpers';
 import { struct, u8, nu64 } from '@solana/buffer-layout';
 import { Buffer } from 'buffer';
+import { RaydiumV4Accounts } from './bot';
 
 type SwapInstruction = {
     instruction: number;
@@ -220,7 +221,8 @@ export class SwapService {
         tokenInMint: string, 
         tokenOutMint: string, 
         amountIn: number,
-        poolAddress?: string
+        poolAddress?: string,
+        raydiumAccounts?: RaydiumV4Accounts
     ): Promise<string | null> {
         try {
             logger.info(`Attempting swap: ${tokenInMint} -> ${tokenOutMint}, amount: ${amountIn}`);
@@ -228,29 +230,45 @@ export class SwapService {
             const tokenInPubkey = new PublicKey(tokenInMint);
             const tokenOutPubkey = new PublicKey(tokenOutMint);
 
-            const poolAccounts = await this.findPoolAccounts(tokenInPubkey, tokenOutPubkey, poolAddress);
-            if (!poolAccounts) {
-                logger.error(`No matching liquidity pool found for ${tokenInMint} -> ${tokenOutMint}`);
-                return null;
-            }
-
-            logger.info(`Found pool: ${poolAccounts.poolId.toString()}`);
-
             // Get or create token accounts
             const userTokenAccountIn = await this.getOrCreateTokenAccount(tokenInPubkey);
             const userTokenAccountOut = await this.getOrCreateTokenAccount(tokenOutPubkey);
 
-            // Create Raydium V4 swap instruction with encoded data
+            // Use provided Raydium accounts if available, otherwise try to find them
+            if (!raydiumAccounts) {
+                logger.error('Raydium V4 accounts not provided');
+                return null;
+            }
+
+            // Here's where we set the user-specific accounts
+            let accounts = {
+                ...raydiumAccounts,
+                userSourceTokenAccount: userTokenAccountIn,      // Token account for input token
+                userDestTokenAccount: userTokenAccountOut,       // Token account for output token
+                userAuthority: this.userWallet.publicKey        // Your wallet's public key
+            };
+
+            // Create Raydium V4 swap instruction
             const swapIx = new TransactionInstruction({
                 programId: this.RAYDIUM_V4_PROGRAM_ID,
                 keys: [
-                    { pubkey: poolAccounts.poolId, isSigner: false, isWritable: true },
-                    { pubkey: poolAccounts.configAccount, isSigner: false, isWritable: false },
-                    { pubkey: userTokenAccountIn, isSigner: false, isWritable: true },
-                    { pubkey: userTokenAccountOut, isSigner: false, isWritable: true },
-                    { pubkey: poolAccounts.tokenAAccount, isSigner: false, isWritable: true },
-                    { pubkey: poolAccounts.tokenBAccount, isSigner: false, isWritable: true },
-                    { pubkey: this.userWallet.publicKey, isSigner: true, isWritable: false },
+                    { pubkey: accounts.ammId, isSigner: false, isWritable: true },
+                    { pubkey: accounts.ammAuthority, isSigner: false, isWritable: false },
+                    { pubkey: accounts.ammOpenOrders, isSigner: false, isWritable: true },
+                    { pubkey: accounts.ammTargetOrders, isSigner: false, isWritable: true },
+                    { pubkey: accounts.poolCoinTokenAccount, isSigner: false, isWritable: true },
+                    { pubkey: accounts.poolPcTokenAccount, isSigner: false, isWritable: true },
+                    { pubkey: accounts.serumProgramId, isSigner: false, isWritable: false },
+                    { pubkey: accounts.serumMarket, isSigner: false, isWritable: true },
+                    { pubkey: accounts.serumBids, isSigner: false, isWritable: true },
+                    { pubkey: accounts.serumAsks, isSigner: false, isWritable: true },
+                    { pubkey: accounts.serumEventQueue, isSigner: false, isWritable: true },
+                    { pubkey: accounts.serumCoinVaultAccount, isSigner: false, isWritable: true },
+                    { pubkey: accounts.serumPcVaultAccount, isSigner: false, isWritable: true },
+                    { pubkey: accounts.serumVaultSigner, isSigner: false, isWritable: false },
+                    { pubkey: accounts.userSourceTokenAccount, isSigner: false, isWritable: true },  // Index 14
+                    { pubkey: accounts.userDestTokenAccount, isSigner: false, isWritable: true },    // Index 15
+                    { pubkey: accounts.userAuthority, isSigner: true, isWritable: false },          // Index 16
                     { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }
                 ],
                 data: await this.encodeRaydiumV4SwapData(amountIn, tokenInPubkey)
