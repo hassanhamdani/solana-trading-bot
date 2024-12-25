@@ -1,7 +1,8 @@
-import { Connection, PublicKey, Keypair, VersionedTransaction } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair, VersionedTransaction, Transaction } from '@solana/web3.js';
 import { logger } from './helpers';
 import { SwapTracker } from './wallet-copier';
 import fetch from 'cross-fetch';
+import { bs58 } from '@project-serum/anchor/dist/cjs/utils/bytes';
 
 
 export interface TradeDetails {
@@ -25,9 +26,8 @@ export class CopyTradingBot {
     private swapTracker: SwapTracker;
     private isRunning: boolean = false;
     private readonly WSOL_MINT = 'So11111111111111111111111111111111111111112';
-    private readonly JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6';
-    private readonly slippagePercentage = Number(process.env.BUY_SLIPPAGE) || 20; // 20% default slippage for memecoins
-    private readonly computeUnitLimit = Number(process.env.COMPUTE_UNIT_LIMIT) || 101337;
+    private readonly SOLANA_TRACKER_API = 'https://swap-v2.solanatracker.io/swap';
+    private readonly slippagePercentage = Number(process.env.BUY_SLIPPAGE) || 20;
     private readonly computeUnitPrice = Number(process.env.COMPUTE_UNIT_PRICE) || 421197;
 
     constructor(
@@ -47,49 +47,62 @@ export class CopyTradingBot {
         this.handleTrade = this.handleTrade.bind(this);
     }
 
-    private async getJupiterQuote(inputMint: string, outputMint: string, amount: number): Promise<any> {
+    private async executeSwap(tokenIn: string, tokenOut: string, amount: number): Promise<string | null> {
         try {
-            const endpoint = `${this.JUPITER_QUOTE_API}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${this.slippagePercentage * 100}`;
-            const response = await fetch(endpoint);
-            const data = await response.json();
-            return data;
-        } catch (error) {
-            logger.error(`Error getting Jupiter quote: ${error}`);
-            return null;
-        }
-    }
+            // Prepare the swap request
+            const swapRequest = {
+                from: tokenIn,
+                to: tokenOut,
+                amount: amount,
+                slippage: this.slippagePercentage,
+                payer: this.userWallet.publicKey.toString(),
+                priorityFee: this.computeUnitPrice / 1_000_000, // Convert to SOL
+                feeType: "add"
+            };
 
-    private async executeJupiterSwap(quoteResponse: any): Promise<string | null> {
-        try {
-            // Get swap transaction
-            const { swapTransaction } = await (
-                await fetch(`${this.JUPITER_QUOTE_API}/swap`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        quoteResponse,
-                        userPublicKey: this.userWallet.publicKey.toString(),
-                        wrapAndUnwrapSol: true,
-                        computeUnitPriceMicroLamports: this.computeUnitPrice,
-                        dynamicComputeUnitLimit: true,
-                        prioritizationFeeLamports: 'auto'
-                    })
-                })
-            ).json();
+            logger.info('Swap request:', swapRequest);
+
+            // Get the swap transaction
+            const response = await fetch(this.SOLANA_TRACKER_API, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(swapRequest)
+            });
+
+            // Add detailed error logging for non-200 responses
+            if (!response.ok) {
+                const errorText = await response.text();
+                logger.error(`API Error (${response.status}): ${errorText}`);
+                return null;
+            }
+
+            const data = await response.json();
+            
+            if (!data || !data.txn) {
+                logger.error('Invalid swap response:', data);
+                return null;
+            }
 
             // Deserialize and sign transaction
-            const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-            const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-            transaction.sign([this.userWallet]);
+            const serializedTxBuffer = Buffer.from(data.txn, 'base64');
+            let transaction;
+
+            if (data.type === 'v0') {
+                transaction = VersionedTransaction.deserialize(serializedTxBuffer);
+                transaction.sign([this.userWallet]);
+            } else {
+                transaction = Transaction.from(serializedTxBuffer);
+                transaction.sign(this.userWallet);
+            }
 
             // Send transaction
-            const rawTransaction = transaction.serialize();
-            const signature = await this.connection.sendRawTransaction(rawTransaction, {
-                skipPreflight: true,
-                maxRetries: 2
-            });
+            const signature = await this.connection.sendRawTransaction(
+                data.type === 'v0' ? transaction.serialize() : transaction.serialize(),
+                {
+                    skipPreflight: true,
+                    maxRetries: 4
+                }
+            );
 
             // Wait for confirmation
             const latestBlockHash = await this.connection.getLatestBlockhash();
@@ -102,7 +115,13 @@ export class CopyTradingBot {
             return signature;
 
         } catch (error) {
-            logger.error(`Error executing Jupiter swap: ${error}`);
+            // Improve error logging with more details
+            if (error instanceof Error) {
+                logger.error(`Error executing swap: ${error.message}`);
+                logger.error(`Stack trace: ${error.stack}`);
+            } else {
+                logger.error(`Error executing swap:`, error);
+            }
             return null;
         }
     }
@@ -110,43 +129,29 @@ export class CopyTradingBot {
     public async handleTrade(tx: TradeDetails) {
         try {
             logger.info(`🔄 Copying trade from transaction: ${tx.signature}`);
+            logger.info('Trade details:', tx);
             
-            // Convert amount to lamports/raw amount (multiply by 10^decimals)
-            // Note: You'll need to get token decimals from token metadata
-            const inputAmount = tx.tokenIn.amount;
-
-            // Get Jupiter quote
-            const quoteResponse = await this.getJupiterQuote(
-                tx.tokenIn.mint,
-                tx.tokenOut.mint,
-                inputAmount
-            );
-
-            if (!quoteResponse) {
-                logger.error('Failed to get Jupiter quote');
+            if (!tx.tokenIn.mint || !tx.tokenOut.mint || !tx.tokenIn.amount) {
+                logger.error('Invalid trade details:', tx);
                 return;
             }
 
-            logger.info('Got Jupiter quote:', {
-                inputAmount: quoteResponse.inputAmount,
-                outputAmount: quoteResponse.outputAmount,
-                priceImpact: quoteResponse.priceImpact,
-                platformFee: quoteResponse.platformFee
-            });
-
-            // Execute the swap
-            const swapSignature = await this.executeJupiterSwap(quoteResponse);
+            const signature = await this.executeSwap(
+                tx.tokenIn.mint,
+                tx.tokenOut.mint,
+                tx.tokenIn.amount
+            );
             
-            if (swapSignature) {
+            if (signature) {
                 logger.info(`✅ Successfully copied trade!`);
-                logger.info(`Transaction signature: ${swapSignature}`);
-                logger.info(`Solscan: https://solscan.io/tx/${swapSignature}`);
+                logger.info(`Transaction signature: ${signature}`);
+                logger.info(`Solscan: https://solscan.io/tx/${signature}`);
             } else {
                 logger.error('Failed to execute swap');
             }
 
         } catch (error) {
-            logger.error(`❌ Error copying trade: ${error}`);
+            logger.error(`❌ Error copying trade:`, error);
         }
     }
 
