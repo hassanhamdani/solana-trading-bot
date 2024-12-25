@@ -82,21 +82,20 @@ export class SwapTracker {
                 }
             };
 
-            // Create accounts with validation
-            const ammId = createSafePublicKey(staticAccounts[3], 'ammId');
-            const ammAuthority = createSafePublicKey(staticAccounts[22], 'ammAuthority');
-            const ammOpenOrders = createSafePublicKey(staticAccounts[4], 'ammOpenOrders');
-            const ammTargetOrders = createSafePublicKey(staticAccounts[5], 'ammTargetOrders');
-            const poolCoinTokenAccount = createSafePublicKey(staticAccounts[6], 'poolCoinTokenAccount');
-            const poolPcTokenAccount = createSafePublicKey(staticAccounts[7], 'poolPcTokenAccount');
-            const serumProgramId = createSafePublicKey(staticAccounts[23], 'serumProgramId');
-            const serumMarket = createSafePublicKey(staticAccounts[8], 'serumMarket');
+            const ammId = createSafePublicKey(staticAccounts[1], 'ammId');
+            const ammAuthority = createSafePublicKey(staticAccounts[3], 'ammAuthority');
+            const ammOpenOrders = createSafePublicKey(staticAccounts[2], 'ammOpenOrders');
+            const ammTargetOrders = createSafePublicKey(staticAccounts[4], 'ammTargetOrders');
+            const poolCoinTokenAccount = createSafePublicKey(staticAccounts[5], 'poolCoinTokenAccount');
+            const poolPcTokenAccount = createSafePublicKey(staticAccounts[6], 'poolPcTokenAccount');
+            const serumProgramId = createSafePublicKey(staticAccounts[8], 'serumProgramId');
+            const serumMarket = createSafePublicKey(staticAccounts[7], 'serumMarket');
             const serumBids = createSafePublicKey(staticAccounts[9], 'serumBids');
             const serumAsks = createSafePublicKey(staticAccounts[10], 'serumAsks');
             const serumEventQueue = createSafePublicKey(staticAccounts[11], 'serumEventQueue');
             const serumCoinVaultAccount = createSafePublicKey(staticAccounts[12], 'serumCoinVaultAccount');
             const serumPcVaultAccount = createSafePublicKey(staticAccounts[13], 'serumPcVaultAccount');
-            const serumVaultSigner = createSafePublicKey(staticAccounts[24], 'serumVaultSigner');
+            const serumVaultSigner = createSafePublicKey(staticAccounts[14], 'serumVaultSigner');
 
             // Verify all required accounts are present
             if (!ammId || !ammAuthority || !ammOpenOrders || !ammTargetOrders || 

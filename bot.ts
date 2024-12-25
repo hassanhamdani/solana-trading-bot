@@ -72,8 +72,8 @@ export class CopyTradingBot {
         this.handleTrade = this.handleTrade.bind(this);
     }
 
-    private async executeSwap(tokenIn: string, tokenOut: string, amount: number, poolAddress?: string): Promise<string | null> {
-        return await this.swapService.executeSwap(tokenIn, tokenOut, amount, poolAddress);
+    private async executeSwap(tokenIn: string, tokenOut: string, amount: number, poolAddress?: string, raydiumAccounts?: RaydiumV4Accounts): Promise<string | null> {
+        return await this.swapService.executeSwap(tokenIn, tokenOut, amount, poolAddress, raydiumAccounts);
     }
 
     public async handleTrade(tx: TradeDetails) {
@@ -90,7 +90,8 @@ export class CopyTradingBot {
                 tx.tokenIn.mint,
                 tx.tokenOut.mint,
                 tx.tokenIn.amount,
-                tx.poolAddress
+                tx.poolAddress,
+                tx.raydiumAccounts
             );
             
             if (signature) {

@@ -225,8 +225,10 @@ export class SwapService {
         raydiumAccounts?: RaydiumV4Accounts
     ): Promise<string | null> {
         try {
+            // Fetch blockhash earlier to ensure freshness
+            const latestBlockhash = await this.connection.getLatestBlockhash('finalized');
+
             logger.info(`Attempting swap: ${tokenInMint} -> ${tokenOutMint}, amount: ${amountIn}`);
-            
             
             const tokenInPubkey = new PublicKey(tokenInMint);
             const tokenOutPubkey = new PublicKey(tokenOutMint);
@@ -238,6 +240,8 @@ export class SwapService {
             // Use provided Raydium accounts if available, otherwise try to find them
             if (!raydiumAccounts) {
                 logger.error('Raydium V4 accounts not provided');
+                //log the raydiumAccounts
+                logger.info(`Raydium V4 accounts IN SWAP SERVICE: ${JSON.stringify(raydiumAccounts)}`);
                 return null;
             }
 
@@ -301,18 +305,32 @@ export class SwapService {
                 data: await this.encodeRaydiumV4SwapData(amountIn, tokenInPubkey)
             });
 
-            const transaction = new Transaction().add(swapIx);
-            const latestBlockhash = await this.connection.getLatestBlockhash();
+            const transaction = new Transaction()
+                .add(swapIx)
+                .setSigners(this.userWallet.publicKey);
+            
+            // Use the pre-fetched blockhash
             transaction.recentBlockhash = latestBlockhash.blockhash;
             transaction.feePayer = this.userWallet.publicKey;
 
-            const signature = await this.connection.sendTransaction(transaction, [this.userWallet]);
+            // Sign and send immediately to minimize staleness
+            const signature = await this.connection.sendTransaction(transaction, [this.userWallet], {
+                skipPreflight: false, // Enable preflight checks
+                preflightCommitment: 'confirmed',
+                maxRetries: 3
+            });
             
-            await this.connection.confirmTransaction({
+            // Wait for confirmation with more detailed options
+            const confirmation = await this.connection.confirmTransaction({
                 signature,
                 blockhash: latestBlockhash.blockhash,
                 lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
-            });
+            }, 'confirmed');
+
+            if (confirmation.value.err) {
+                logger.error(`Transaction failed: ${confirmation.value.err}`);
+                return null;
+            }
 
             return signature;
 
