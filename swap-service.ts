@@ -305,11 +305,9 @@ export class SwapService {
                 data: await this.encodeRaydiumV4SwapData(amountIn, tokenInPubkey)
             });
 
-            const transaction = new Transaction()
-                .add(swapIx)
-                .setSigners(this.userWallet.publicKey);
+            const transaction = new Transaction();
+            transaction.add(swapIx);
             
-            // Use the pre-fetched blockhash
             transaction.recentBlockhash = latestBlockhash.blockhash;
             transaction.feePayer = this.userWallet.publicKey;
 
