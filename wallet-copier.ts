@@ -36,94 +36,92 @@ export class SwapTracker {
     private async analyzeTransaction(tx: TransactionResponse | VersionedTransactionResponse) {
         if (!tx.meta) return;
 
+        // Extract key transaction details
+        const signature = tx.transaction.signatures[0];
+        const timestamp = tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleString() : 'Unknown';
+        
+        // Get token balance changes
         const preTokenBalances = tx.meta.preTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
         const postTokenBalances = tx.meta.postTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
         
-        // Get program IDs involved in the transaction
-       // const programIds = tx.transaction.message.programIds().map(prog => prog.toString());
-        
-        // Get relevant logs
-        const logs = tx.meta.logMessages || [];
-        const relevantLogs = logs.filter(log => 
-            log.includes('Instruction:') || 
-            log.includes('Program log:') ||
-            log.includes('Swap') ||
-            log.includes('Transfer')
-        );
+        // Calculate token changes
+        const tokenChanges = postTokenBalances.map(post => {
+            const pre = preTokenBalances.find(p => p?.mint === post?.mint);
+            return {
+                mint: post?.mint,
+                change: (post?.uiAmount || 0) - (pre?.uiAmount || 0)
+            };
+        }).filter(change => change.change !== 0);
 
-        logger.info('🔄 Transaction Analysis:');
-        logger.info('------------------------');
-        logger.info(`Signature: ${tx.transaction.signatures[0]}`);
-        logger.info(`Time: ${new Date(tx.blockTime! * 1000).toLocaleString()}`);
-        
-        // Show token balance changes
-        if (preTokenBalances.length > 0 || postTokenBalances.length > 0) {
+        // Only log if there are token changes
+        if (tokenChanges.length > 0) {
+            logger.info('\n🔄 Transaction Details:');
+            logger.info('------------------------');
+            logger.info(`Signature: ${signature}`);
+            logger.info(`Time: ${timestamp}`);
+            
             logger.info('\n📊 Token Changes:');
-            const allMints = new Set([
-                ...preTokenBalances.map(b => b!.mint),
-                ...postTokenBalances.map(b => b!.mint)
-            ]);
-
-            allMints.forEach(mint => {
-                const pre = preTokenBalances.find(b => b!.mint === mint)?.uiAmount || 0;
-                const post = postTokenBalances.find(b => b!.mint === mint)?.uiAmount || 0;
-                const change = post - pre;
-                if (change !== 0) {
-                    logger.info(`Token: ${mint}`);
-                    logger.info(`  ${change > 0 ? '📈 Received' : '📉 Sent'}: ${Math.abs(change)}`);
-                }
-            });
-        }
-
-        // Show programs involved
-        logger.info('\n🔧 Programs Involved:');
-       // programIds.forEach(prog => logger.info(`  ${prog}`));
-
-        // Show relevant instruction logs
-        if (relevantLogs.length > 0) {
-            logger.info('\n📝 Key Instructions:');
-            relevantLogs.forEach(log => logger.info(`  ${log}`));
-        }
-
-        // Show transaction data that might be needed for replication
-        logger.info('\n🔑 Trade Data:');
-        logger.info(`Recent Blockhash: ${tx.transaction.message.recentBlockhash}`);
-        logger.info(`Compute Units: ${tx.meta.computeUnitsConsumed}`);
-        
-        // Prepare trade details and call the bot
-        if (preTokenBalances.length > 0 && postTokenBalances.length > 0) {
-            const tokenChanges = postTokenBalances.map(post => {
-                const pre = preTokenBalances.find(p => p?.mint === post?.mint);
-                return {
-                    mint: post?.mint,
-                    change: (post?.uiAmount || 0) - (pre?.uiAmount || 0)
-                };
+            tokenChanges.forEach(change => {
+                const direction = change.change > 0 ? '📈 Received' : '📉 Sent';
+                logger.info(`${direction}: ${Math.abs(change.change)} (Mint: ${change.mint})`);
             });
 
+            // Get relevant program logs (only swap-related)
+            const relevantLogs = tx.meta.logMessages?.filter(log => 
+                log.includes('Instruction: Swap') ||
+                log.includes('Program log: Swap') ||
+                log.includes('Program log: ray_log')
+            ) || [];
+
+            if (relevantLogs.length > 0) {
+                logger.info('\n📝 Swap Details:');
+                relevantLogs.forEach(log => {
+                    if (log.includes('ray_log')) {
+                        logger.info('  Raydium Swap Executed');
+                    } else {
+                        logger.info(`  ${log}`);
+                    }
+                });
+            }
+
+            // Prepare trade details and call the bot
             const tokenIn = tokenChanges.find(t => t.change < 0);
             const tokenOut = tokenChanges.find(t => t.change > 0);
 
             if (tokenIn && tokenOut) {
-                const tradeDetails: TradeDetails = {
-                    tokenIn: {
-                        mint: tokenIn.mint!,
-                        amount: Math.abs(tokenIn.change)
-                    },
-                    tokenOut: {
-                        mint: tokenOut.mint!,
-                        amount: tokenOut.change
-                    },
-                    signature: tx.transaction.signatures[0],
-                    blockhash: tx.transaction.message.recentBlockhash,
-                    computeUnits: tx.meta.computeUnitsConsumed || 0
-                };
+                const raydiumV4ProgramId = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+                
+                // Find Raydium instruction (index 2 in this case based on the log)
+                const raydiumInstruction = tx.transaction.message.compiledInstructions.find(
+                    ix => tx.transaction.message.staticAccountKeys[ix.programIdIndex].toString() === raydiumV4ProgramId
+                );
 
-                // Call the bot's handleTrade method
-                await this.bot.handleTrade(tradeDetails);
+                if (raydiumInstruction) {
+                    // The pool address is the second account in the instruction (index 1)
+                    const poolAddress = tx.transaction.message.staticAccountKeys[raydiumInstruction.accountKeyIndexes[1]];
+                    logger.info(`Found Raydium pool address: ${poolAddress.toString()}`);
+
+                    const tradeDetails: TradeDetails = {
+                        tokenIn: {
+                            mint: tokenIn.mint!,
+                            amount: Math.abs(tokenIn.change)
+                        },
+                        tokenOut: {
+                            mint: tokenOut.mint!,
+                            amount: tokenOut.change
+                        },
+                        signature: signature,
+                        blockhash: tx.transaction.message.recentBlockhash,
+                        computeUnits: tx.meta.computeUnitsConsumed || 0,
+                        poolAddress: poolAddress.toString()  // Add the pool address
+                    };
+
+                    await this.bot.handleTrade(tradeDetails);
+                }
             }
-        }
 
-        logger.info('------------------------\n');
+            logger.info('------------------------\n');
+        }
     }
 
     async trackSwaps() {

@@ -3,6 +3,7 @@ import { logger } from './helpers';
 import { SwapTracker } from './wallet-copier';
 import fetch from 'cross-fetch';
 import { bs58 } from '@project-serum/anchor/dist/cjs/utils/bytes';
+import { SwapService } from './swap-service';
 
 
 export interface TradeDetails {
@@ -17,6 +18,7 @@ export interface TradeDetails {
     signature: string;
     blockhash: string;
     computeUnits: number;
+    poolAddress?: string;
 }
 
 export class CopyTradingBot {
@@ -29,6 +31,7 @@ export class CopyTradingBot {
     private readonly SOLANA_TRACKER_API = 'https://swap-v2.solanatracker.io/swap';
     private readonly slippagePercentage = Number(process.env.BUY_SLIPPAGE) || 20;
     private readonly computeUnitPrice = Number(process.env.COMPUTE_UNIT_PRICE) || 421197;
+    private swapService: SwapService;
 
     constructor(
         connection: Connection,
@@ -42,88 +45,14 @@ export class CopyTradingBot {
         const decodedKey = bs58.decode(privateKey);
         this.userWallet = Keypair.fromSecretKey(decodedKey);
         this.swapTracker = new SwapTracker(connection, targetWallet, this);
+        this.swapService = new SwapService(connection, this.userWallet);
         
         // Bind the trade handler to this instance
         this.handleTrade = this.handleTrade.bind(this);
     }
 
-    private async executeSwap(tokenIn: string, tokenOut: string, amount: number): Promise<string | null> {
-        try {
-            // Prepare the swap request
-            const swapRequest = {
-                from: tokenIn,
-                to: tokenOut,
-                amount: amount,
-                slippage: this.slippagePercentage,
-                payer: this.userWallet.publicKey.toString(),
-                priorityFee: this.computeUnitPrice / 1_000_000, // Convert to SOL
-                feeType: "add"
-            };
-
-            logger.info('Swap request:', swapRequest);
-
-            // Get the swap transaction
-            const response = await fetch(this.SOLANA_TRACKER_API, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(swapRequest)
-            });
-
-            // Add detailed error logging for non-200 responses
-            if (!response.ok) {
-                const errorText = await response.text();
-                logger.error(`API Error (${response.status}): ${errorText}`);
-                return null;
-            }
-
-            const data = await response.json();
-            
-            if (!data || !data.txn) {
-                logger.error('Invalid swap response:', data);
-                return null;
-            }
-
-            // Deserialize and sign transaction
-            const serializedTxBuffer = Buffer.from(data.txn, 'base64');
-            let transaction;
-
-            if (data.type === 'v0') {
-                transaction = VersionedTransaction.deserialize(serializedTxBuffer);
-                transaction.sign([this.userWallet]);
-            } else {
-                transaction = Transaction.from(serializedTxBuffer);
-                transaction.sign(this.userWallet);
-            }
-
-            // Send transaction
-            const signature = await this.connection.sendRawTransaction(
-                data.type === 'v0' ? transaction.serialize() : transaction.serialize(),
-                {
-                    skipPreflight: true,
-                    maxRetries: 4
-                }
-            );
-
-            // Wait for confirmation
-            const latestBlockHash = await this.connection.getLatestBlockhash();
-            await this.connection.confirmTransaction({
-                blockhash: latestBlockHash.blockhash,
-                lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
-                signature
-            });
-
-            return signature;
-
-        } catch (error) {
-            // Improve error logging with more details
-            if (error instanceof Error) {
-                logger.error(`Error executing swap: ${error.message}`);
-                logger.error(`Stack trace: ${error.stack}`);
-            } else {
-                logger.error(`Error executing swap:`, error);
-            }
-            return null;
-        }
+    private async executeSwap(tokenIn: string, tokenOut: string, amount: number, poolAddress?: string): Promise<string | null> {
+        return await this.swapService.executeSwap(tokenIn, tokenOut, amount, poolAddress);
     }
 
     public async handleTrade(tx: TradeDetails) {
@@ -139,7 +68,8 @@ export class CopyTradingBot {
             const signature = await this.executeSwap(
                 tx.tokenIn.mint,
                 tx.tokenOut.mint,
-                tx.tokenIn.amount
+                tx.tokenIn.amount,
+                tx.poolAddress
             );
             
             if (signature) {
