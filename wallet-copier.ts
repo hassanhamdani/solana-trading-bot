@@ -141,21 +141,7 @@ export class SwapTracker {
         const signature = tx.transaction.signatures[0];
         const timestamp = tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleString() : 'Unknown';
 
-        // Create log object
-        const logData = {
-            signature,
-            timestamp,
-            allLogs: tx.meta.logMessages,
-            preTokenBalances: tx.meta.preTokenBalances,
-            postTokenBalances: tx.meta.postTokenBalances,
-            rawTransaction: tx
-        };
-
-        // Save complete log to file
-        const logFileName = `swap-${signature}.json`;
-        await fs.writeFile(logFileName, JSON.stringify(logData, null, 2));
-
-        // Continue with existing trade processing logic
+        // Parse token balances
         const preTokenBalances = tx.meta.preTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
         const postTokenBalances = tx.meta.postTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
         
@@ -168,66 +154,45 @@ export class SwapTracker {
             };
         }).filter(change => change.change !== 0);
 
-        // Only log if there are token changes
-        if (tokenChanges.length > 0) {
-            logger.info('\n🔄 Transaction Details:');
-            logger.info('------------------------');
-            logger.info(`Signature: ${signature}`);
-            logger.info(`Time: ${timestamp}`);
-            
-            logger.info('\n📊 Token Changes:');
-            tokenChanges.forEach(change => {
-                const direction = change.change > 0 ? '📈 Received' : '📉 Sent';
-                logger.info(`${direction}: ${Math.abs(change.change)} (Mint: ${change.mint})`);
-            });
+        if (tokenChanges.length >= 2) {
+            const firstSend = tokenChanges[0];
+            const firstReceive = tokenChanges[1];
 
-            // Get relevant program logs (only swap-related)
-            const relevantLogs = tx.meta.logMessages?.filter(log => 
-                log.includes('Instruction: Swap') ||
-                log.includes('Program log: Swap') ||
-                log.includes('Program log: ray_log')
-            ) || [];
+            if (firstSend.change < 0 && firstReceive.change > 0) {
+                logger.info('\n🔄 Transaction Details:');
+                logger.info('------------------------');
+                logger.info(`Signature: ${signature}`);
+                logger.info(`Time: ${timestamp}`);
+                
+                // Only log the relevant swap
+                logger.info('\n📊 Swap Details:');
+                logger.info(`📉 Sent: ${Math.abs(firstSend.change)} (${firstSend.mint})`);
+                logger.info(`📈 Received: ${firstReceive.change} (${firstReceive.mint})`);
 
-            if (relevantLogs.length > 0) {
-                logger.info('\n📝 Swap Details:');
-                relevantLogs.forEach(log => {
-                    if (log.includes('ray_log')) {
-                        logger.info('  Raydium Swap Executed');
-                    } else {
-                        logger.info(`  ${log}`);
-                    }
-                });
-            }
-
-            // Prepare trade details and call the bot
-            const tokenIn = tokenChanges.find(t => t.change < 0);
-            const tokenOut = tokenChanges.find(t => t.change > 0);
-
-            if (tokenIn && tokenOut) {
                 const raydiumAccounts = this.extractRaydiumV4Accounts(tx);
                 
                 if (raydiumAccounts) {
                     const tradeDetails: TradeDetails = {
                         tokenIn: {
-                            mint: tokenIn.mint!,
-                            amount: Math.abs(tokenIn.change)
+                            mint: firstSend.mint!,
+                            amount: Math.abs(firstSend.change)
                         },
                         tokenOut: {
-                            mint: tokenOut.mint!,
-                            amount: tokenOut.change
+                            mint: firstReceive.mint!,
+                            amount: Math.abs(firstReceive.change)
                         },
                         signature: signature,
                         blockhash: tx.transaction.message.recentBlockhash,
                         computeUnits: tx.meta.computeUnitsConsumed || 0,
                         poolAddress: raydiumAccounts.ammId.toString(),
-                        raydiumAccounts  // Add the full accounts structure
+                        raydiumAccounts
                     };
 
                     await this.bot.handleTrade(tradeDetails);
                 }
-            }
 
-            logger.info('------------------------\n');
+                logger.info('------------------------\n');
+            }
         }
     }
 
@@ -278,5 +243,11 @@ export class SwapTracker {
     stop() {
         this.isTracking = false;
         logger.info('🛑 Stopping wallet tracking...');
+    }
+
+    private isSOLorUSDC(mint: string): boolean {
+        const WSOL = 'So11111111111111111111111111111111111111112';
+        const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+        return mint === WSOL || mint === USDC;
     }
 }

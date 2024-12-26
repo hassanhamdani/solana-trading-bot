@@ -4,6 +4,8 @@ import { logger } from './helpers';
 import { struct, u8, nu64 } from '@solana/buffer-layout';
 import { Buffer } from 'buffer';
 import { RaydiumV4Accounts } from './bot';
+import bs58 from 'bs58';
+import nacl from 'tweetnacl';
 
 type SwapInstruction = {
     instruction: number;
@@ -16,9 +18,33 @@ export class SwapService {
     private connection: Connection;
     private userWallet: Keypair;
 
-    constructor(connection: Connection, userWallet: Keypair) {
+    constructor(connection: Connection, userWallet: Keypair | string) {
         this.connection = connection;
-        this.userWallet = userWallet;
+        
+        if (typeof userWallet === 'string') {
+            try {
+                const privateKeyBytes = bs58.decode(userWallet);
+                this.userWallet = Keypair.fromSecretKey(privateKeyBytes);
+                logger.info(`Wallet initialized with public key: ${this.userWallet.publicKey.toString()}`);
+                logger.info(`Wallet secret key length: ${this.userWallet.secretKey.length}`);
+                
+                // Verify the wallet has signing capability
+                const testData = Buffer.from('test');
+                try {
+                    const signature = nacl.sign.detached(testData, this.userWallet.secretKey);
+                    logger.info('Wallet successfully performed test signature');
+                } catch (e) {
+                    logger.error('Wallet failed test signature');
+                    throw e;
+                }
+            } catch (error) {
+                logger.error(`Failed to create Keypair from private key: ${error}`);
+                throw error;
+            }
+        } else {
+            this.userWallet = userWallet;
+            logger.info(`Wallet initialized from provided Keypair: ${this.userWallet.publicKey.toString()}`);
+        }
     }
 
     async findPoolAccounts(tokenInMint: PublicKey, tokenOutMint: PublicKey, poolAddress?: string) {
@@ -196,18 +222,53 @@ export class SwapService {
                 );
 
                 const transaction = new Transaction().add(createAtaIx);
-                const latestBlockhash = await this.connection.getLatestBlockhash();
+                
+                // Get a fresh blockhash
+                const latestBlockhash = await this.connection.getLatestBlockhash('finalized');
                 transaction.recentBlockhash = latestBlockhash.blockhash;
+                transaction.lastValidBlockHeight = latestBlockhash.lastValidBlockHeight;
                 transaction.feePayer = this.userWallet.publicKey;
 
-                const signature = await this.connection.sendTransaction(transaction, [this.userWallet]);
-                await this.connection.confirmTransaction({
-                    signature,
-                    blockhash: latestBlockhash.blockhash,
-                    lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
-                });
+                // Add retry logic
+                let retries = 3;
+                while (retries > 0) {
+                    try {
+                        const signature = await this.connection.sendTransaction(
+                            transaction, 
+                            [this.userWallet],
+                            {
+                                skipPreflight: false,
+                                preflightCommitment: 'confirmed',
+                                maxRetries: 3
+                            }
+                        );
 
-                logger.info(`Created token account: ${associatedTokenAddress.toString()}`);
+                        // Wait for confirmation with timeout
+                        const confirmation = await Promise.race([
+                            this.connection.confirmTransaction({
+                                signature,
+                                blockhash: latestBlockhash.blockhash,
+                                lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+                            }, 'confirmed'),
+                            new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Confirmation timeout')), 30000)
+                            )
+                        ]);
+
+                        logger.info(`Created token account: ${associatedTokenAddress.toString()}`);
+                        break;
+                    } catch (error) {
+                        retries--;
+                        if (retries === 0) {
+                            throw error;
+                        }
+                        logger.warn(`Retrying token account creation. Attempts remaining: ${retries}`);
+                        
+                        // Get fresh blockhash for retry
+                        const newBlockhash = await this.connection.getLatestBlockhash('finalized');
+                        transaction.recentBlockhash = newBlockhash.blockhash;
+                    }
+                }
             }
 
             return associatedTokenAddress;
@@ -215,6 +276,12 @@ export class SwapService {
             logger.error(`Error creating token account: ${error}`);
             throw error;
         }
+    }
+
+    private async checkTokenAccount(mint: PublicKey): Promise<{ exists: boolean, address: PublicKey }> {
+        const address = await getAssociatedTokenAddress(mint, this.userWallet.publicKey);
+        const account = await this.connection.getAccountInfo(address);
+        return { exists: account !== null, address };
     }
 
     async executeSwap(
@@ -225,17 +292,54 @@ export class SwapService {
         raydiumAccounts?: RaydiumV4Accounts
     ): Promise<string | null> {
         try {
-            // Fetch blockhash earlier to ensure freshness
-            const latestBlockhash = await this.connection.getLatestBlockhash('finalized');
-
             logger.info(`Attempting swap: ${tokenInMint} -> ${tokenOutMint}, amount: ${amountIn}`);
             
-            const tokenInPubkey = new PublicKey(tokenInMint);
-            const tokenOutPubkey = new PublicKey(tokenOutMint);
+            // Check if this is a buy or sell
+            const isSol = (mint: string) => mint === 'So11111111111111111111111111111111111111112';
+            const isSOLorUSDC = (mint: string) => 
+                isSol(mint) || 
+                mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'; // USDC mint
 
-            // Get or create token accounts
-            const userTokenAccountIn = await this.getOrCreateTokenAccount(tokenInPubkey);
-            const userTokenAccountOut = await this.getOrCreateTokenAccount(tokenOutPubkey);
+            const isBuy = isSOLorUSDC(tokenInMint);
+            logger.info(`Operation type: ${isBuy ? 'BUY' : 'SELL'}`);
+
+            // Check token accounts
+            const tokenInCheck = await this.checkTokenAccount(new PublicKey(tokenInMint));
+            const tokenOutCheck = await this.checkTokenAccount(new PublicKey(tokenOutMint));
+            
+            logger.info(`Input token account ${tokenInCheck.exists ? 'exists' : 'needs creation'}`);
+            logger.info(`Output token account ${tokenOutCheck.exists ? 'exists' : 'needs creation'}`);
+
+            // Validate account state based on operation type
+            if (isBuy) {
+                if (!tokenInCheck.exists) {
+                    logger.error('Input token account (SOL/USDC) does not exist. Cannot proceed with buy.');
+                    return null;
+                }
+            } else { // Sell
+                if (!tokenInCheck.exists) {
+                    logger.error('Input token account does not exist. Cannot sell tokens you don\'t have.');
+                    return null;
+                }
+            }
+
+            // Create accounts if needed
+            const userTokenAccountIn = tokenInCheck.exists ? 
+                tokenInCheck.address : 
+                await this.getOrCreateTokenAccount(new PublicKey(tokenInMint));
+            
+            const userTokenAccountOut = tokenOutCheck.exists ? 
+                tokenOutCheck.address : 
+                await this.getOrCreateTokenAccount(new PublicKey(tokenOutMint));
+
+            // Verify balance for input token
+            const inputBalance = await this.connection.getTokenAccountBalance(userTokenAccountIn);
+            logger.info(`Input token balance: ${inputBalance.value.uiAmountString}`);
+            
+            if (!inputBalance.value.uiAmount || inputBalance.value.uiAmount < amountIn) {
+                logger.error(`Insufficient balance. Required: ${amountIn}, Available: ${inputBalance.value.uiAmountString}`);
+                return null;
+            }
 
             // Use provided Raydium accounts if available, otherwise try to find them
             if (!raydiumAccounts) {
@@ -248,11 +352,38 @@ export class SwapService {
             // Here's where we set the user-specific accounts
             let accounts = {
                 ...raydiumAccounts,
-                userSourceTokenAccount: userTokenAccountIn,      // Token account for input token
-                userDestTokenAccount: userTokenAccountOut,       // Token account for output token
-                userAuthority: this.userWallet.publicKey        // Your wallet's public key
+                userSourceTokenAccount: userTokenAccountIn,      
+                userDestTokenAccount: userTokenAccountOut,       
+                userAuthority: this.userWallet.publicKey        
             };
 
+            // Validate user-specific accounts
+            if (!accounts.userSourceTokenAccount || !accounts.userDestTokenAccount || !accounts.userAuthority) {
+                logger.error('Missing user-specific accounts');
+                logger.info(`Source Account: ${accounts.userSourceTokenAccount?.toString()}`);
+                logger.info(`Destination Account: ${accounts.userDestTokenAccount?.toString()}`);
+                logger.info(`User Authority: ${accounts.userAuthority?.toString()}`);
+                return null;
+            }
+
+            // Verify ownership of token accounts
+            try {
+                const sourceInfo = await this.connection.getAccountInfo(accounts.userSourceTokenAccount);
+                const destInfo = await this.connection.getAccountInfo(accounts.userDestTokenAccount);
+                
+                if (!sourceInfo || !destInfo) {
+                    logger.error('Token accounts not found');
+                    return null;
+                }
+
+                logger.info('✅ User accounts validated successfully');
+            } catch (error) {
+                logger.error(`Error validating token accounts: ${error}`);
+                return null;
+            }
+
+            logger.info(`User Authority (Wallet Public Key): ${this.userWallet.publicKey.toString()}`);
+            
             logger.info('Static Accounts Array:');
             const accountsArray = [
                 { name: 'ammId', pubkey: accounts.ammId },
@@ -283,40 +414,50 @@ export class SwapService {
             const swapIx = new TransactionInstruction({
                 programId: this.RAYDIUM_V4_PROGRAM_ID,
                 keys: [
+                    // AMM Accounts
                     { pubkey: accounts.ammId, isSigner: false, isWritable: true },
                     { pubkey: accounts.ammAuthority, isSigner: false, isWritable: false },
                     { pubkey: accounts.ammOpenOrders, isSigner: false, isWritable: true },
                     { pubkey: accounts.ammTargetOrders, isSigner: false, isWritable: true },
                     { pubkey: accounts.poolCoinTokenAccount, isSigner: false, isWritable: true },
                     { pubkey: accounts.poolPcTokenAccount, isSigner: false, isWritable: true },
-                    { pubkey: accounts.serumProgramId, isSigner: false, isWritable: false },
+                    
+                    // Serum Accounts
                     { pubkey: accounts.serumMarket, isSigner: false, isWritable: true },
+                    { pubkey: accounts.serumProgramId, isSigner: false, isWritable: false },
                     { pubkey: accounts.serumBids, isSigner: false, isWritable: true },
                     { pubkey: accounts.serumAsks, isSigner: false, isWritable: true },
                     { pubkey: accounts.serumEventQueue, isSigner: false, isWritable: true },
                     { pubkey: accounts.serumCoinVaultAccount, isSigner: false, isWritable: true },
                     { pubkey: accounts.serumPcVaultAccount, isSigner: false, isWritable: true },
                     { pubkey: accounts.serumVaultSigner, isSigner: false, isWritable: false },
-                    { pubkey: accounts.userSourceTokenAccount, isSigner: false, isWritable: true },  // Index 14
-                    { pubkey: accounts.userDestTokenAccount, isSigner: false, isWritable: true },    // Index 15
-                    { pubkey: accounts.userAuthority, isSigner: true, isWritable: false },          // Index 16
+                    
+                    // User Accounts
+                    { pubkey: accounts.userSourceTokenAccount, isSigner: false, isWritable: true },
+                    { pubkey: accounts.userDestTokenAccount, isSigner: false, isWritable: true },
+                    { pubkey: accounts.userAuthority, isSigner: true, isWritable: false },
                     { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }
                 ],
-                data: await this.encodeRaydiumV4SwapData(amountIn, tokenInPubkey)
+                data: await this.encodeRaydiumV4SwapData(amountIn, new PublicKey(tokenInMint))
             });
 
             const transaction = new Transaction();
             transaction.add(swapIx);
             
+            const latestBlockhash = await this.connection.getLatestBlockhash('finalized');
             transaction.recentBlockhash = latestBlockhash.blockhash;
+            transaction.lastValidBlockHeight = latestBlockhash.lastValidBlockHeight;
             transaction.feePayer = this.userWallet.publicKey;
 
             // Sign and send immediately to minimize staleness
-            const signature = await this.connection.sendTransaction(transaction, [this.userWallet], {
-                skipPreflight: false, // Enable preflight checks
-                preflightCommitment: 'confirmed',
-                maxRetries: 3
-            });
+            const signature = await this.connection.sendRawTransaction(
+                transaction.serialize(),
+                {
+                    skipPreflight: false,
+                    preflightCommitment: 'confirmed',
+                    maxRetries: 3
+                }
+            );
             
             // Wait for confirmation with more detailed options
             const confirmation = await this.connection.confirmTransaction({
@@ -326,7 +467,7 @@ export class SwapService {
             }, 'confirmed');
 
             if (confirmation.value.err) {
-                logger.error(`Transaction failed: ${confirmation.value.err}`);
+                logger.error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
                 return null;
             }
 

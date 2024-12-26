@@ -79,13 +79,26 @@ export class CopyTradingBot {
     public async handleTrade(tx: TradeDetails) {
         try {
             logger.info(`🔄 Copying trade from transaction: ${tx.signature}`);
-            logger.info('Trade details:', tx);
+            logger.info('Trade details:', JSON.stringify({
+                tokenIn: {
+                    mint: tx.tokenIn.mint,
+                    amount: tx.tokenIn.amount
+                },
+                tokenOut: {
+                    mint: tx.tokenOut.mint
+                }
+            }, null, 2));
             
-            if (!tx.tokenIn.mint || !tx.tokenOut.mint || !tx.tokenIn.amount) {
-                logger.error('Invalid trade details:', tx);
-                return;
-            }
+            // Determine if this is a buy or sell
+            const isSol = (mint: string) => mint === this.WSOL_MINT;
+            const isUSDC = (mint: string) => mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+            const isSOLorUSDC = (mint: string) => isSol(mint) || isUSDC(mint);
 
+            const targetIsBuying = isSOLorUSDC(tx.tokenIn.mint);
+            logger.info(`Target wallet is ${targetIsBuying ? 'BUYING' : 'SELLING'}`);
+
+            // For buys: we want to use the same input token as the target
+            // For sells: we want to use the same output token as the target
             const signature = await this.executeSwap(
                 tx.tokenIn.mint,
                 tx.tokenOut.mint,
