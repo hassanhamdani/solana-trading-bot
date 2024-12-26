@@ -2,6 +2,7 @@ import { Connection } from '@solana/web3.js';
 import { logger, COMMITMENT_LEVEL, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT, LOG_LEVEL } from './helpers';
 import { SwapTracker } from './wallet-copier';
 import { CopyTradingBot as Bot } from './bot';
+import { loadAndTrimPoolData } from './src/utils/pool-utils';
 
 const connection = new Connection(RPC_ENDPOINT, {
     wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
@@ -15,6 +16,11 @@ const connection = new Connection(RPC_ENDPOINT, {
 const runSwapTracker = async () => {
     logger.level = LOG_LEVEL;
     logger.info('Swap tracker is starting...');
+
+    // Load and trim pool data
+    logger.info('Loading pool data...');
+    await loadAndTrimPoolData();
+    logger.info('Pool data loaded successfully');
 
     const walletToTrack = '5iywveQKkidqPDKt2CExJcWKex2EXz9kbGcYiZvhuXWs';
     logger.info(`Starting to track wallet: ${walletToTrack}`);
