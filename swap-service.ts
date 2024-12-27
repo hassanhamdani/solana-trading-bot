@@ -206,8 +206,8 @@ export class SwapService {
 
             // 2. Get recommended priority fees
             const { data: priorityFeeData } = await axios.get(`${API_URLS.BASE_HOST}${API_URLS.PRIORITY_FEE}`);
-            const computeUnitPrice = String(priorityFeeData.data.default.h); // Using 'high' priority
-            logger.info(`Using compute unit price: ${computeUnitPrice}`);
+            const computeUnitPrice = String(priorityFeeData.data.default.m); // Changed from 'h' to 'm' for medium priority
+            logger.info(`Using compute unit price: ${computeUnitPrice} (priority: medium)`);
 
             // 3. Build transaction via POST
             const buildTxUrl = `${API_URLS.SWAP_HOST}/transaction/swap-base-in`;
