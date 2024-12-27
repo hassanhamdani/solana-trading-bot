@@ -40,9 +40,111 @@ export class SwapService {
         tokenInMint: string,
         tokenOutMint: string,
         amountIn: number,
-        poolAddress?: string,
+        targetWalletAddress?: string,
+        isSellingTransaction?: boolean
     ): Promise<string | null> {
         try {
+            if (isSellingTransaction && targetWalletAddress) {
+                // Constants for safety checks
+                const MIN_SELL_PERCENTAGE = 1; // Don't sell if less than 1%
+                const MAX_SELL_PERCENTAGE = 100; // Cap at 100%
+                const MIN_TRANSACTION_VALUE_SOL = 0.001; // Minimum transaction value in SOL
+
+                // Get target wallet's balance
+                const targetWalletPubkey = new PublicKey(targetWalletAddress);
+                const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                    targetWalletPubkey,
+                    { mint: new PublicKey(tokenInMint) }
+                );
+
+                // Get our wallet's balance
+                const ourTokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                    this.userWallet.publicKey,
+                    { mint: new PublicKey(tokenInMint) }
+                );
+
+                // Safety checks
+                if (!tokenAccounts.value.length) {
+                    logger.error('Target wallet has no token account for this token');
+                    return null;
+                }
+
+                if (!ourTokenAccounts.value.length) {
+                    logger.error('Our wallet has no token account for this token');
+                    return null;
+                }
+
+                const targetCurrentBalance = Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
+                const ourCurrentBalance = Number(ourTokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
+
+                // Validate balances
+                if (targetCurrentBalance <= 0) {
+                    logger.error('Target wallet has zero balance');
+                    return null;
+                }
+
+                if (ourCurrentBalance <= 0) {
+                    logger.error('Our wallet has zero balance');
+                    return null;
+                }
+
+                // Calculate sell percentage
+                const targetSellAmount = amountIn;
+                if (targetSellAmount > targetCurrentBalance) {
+                    logger.error('Target sell amount exceeds their balance - possible error in input');
+                    return null;
+                }
+
+                let targetSellPercentage = (targetSellAmount / targetCurrentBalance) * 100;
+
+                // Apply safety thresholds
+                if (targetSellPercentage < MIN_SELL_PERCENTAGE) {
+                    logger.warn(`Sell percentage (${targetSellPercentage.toFixed(2)}%) below minimum threshold, skipping`);
+                    return null;
+                }
+
+                if (targetSellPercentage > MAX_SELL_PERCENTAGE) {
+                    logger.warn(`Sell percentage capped from ${targetSellPercentage.toFixed(2)}% to ${MAX_SELL_PERCENTAGE}%`);
+                    targetSellPercentage = MAX_SELL_PERCENTAGE;
+                }
+
+                // Calculate our sell amount
+                let ourSellAmount = (ourCurrentBalance * targetSellPercentage) / 100;
+
+                // Get token price in SOL for minimum value check
+                try {
+                    const { data: priceData } = await axios.get(
+                        `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenInMint}&outputMint=${tokenOutMint}&amount=${Math.floor(ourSellAmount)}&slippageBps=1000`
+                    );
+                    
+                    const expectedSolOutput = priceData.outputAmount / 1e9; // Convert lamports to SOL
+                    
+                    if (expectedSolOutput < MIN_TRANSACTION_VALUE_SOL) {
+                        logger.warn(`Transaction value (${expectedSolOutput} SOL) below minimum threshold, skipping`);
+                        return null;
+                    }
+                } catch (error) {
+                    logger.error('Failed to check minimum transaction value:', error);
+                    return null;
+                }
+
+                // Round to appropriate decimal places based on token decimals
+                const tokenDecimals = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.decimals;
+                ourSellAmount = Math.floor(ourSellAmount); // Ensure we have a whole number of base units
+
+                logger.info({
+                    targetCurrentBalance,
+                    ourCurrentBalance,
+                    targetSellAmount,
+                    targetSellPercentage: targetSellPercentage.toFixed(2) + '%',
+                    ourSellAmount,
+                    tokenDecimals
+                });
+
+                // Update amountIn for the actual swap
+                amountIn = ourSellAmount;
+            }
+
             logger.info(`Attempting swap via Raydium API:`);
             logger.info(`Token In: ${tokenInMint}`);
             logger.info(`Token Out: ${tokenOutMint}`);
@@ -60,7 +162,7 @@ export class SwapService {
             logger.info(`Amount In (lamports): ${amountInLamports}`);
 
             // 1. Get quote from Raydium API
-            const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenInMint}&outputMint=${tokenOutMint}&amount=${amountInLamports}&slippageBps=20&txVersion=V0`;
+            const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenInMint}&outputMint=${tokenOutMint}&amount=${amountInLamports}&slippageBps=1000&txVersion=V0`;
             
             logger.info(`Fetching quote from: ${swapQuoteUrl}`);
             let swapResponse;
