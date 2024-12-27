@@ -10,26 +10,6 @@ interface TokenBalance {
     uiAmount: number;
 }
 
-interface RaydiumV4Accounts {
-    ammId: PublicKey;
-    ammAuthority: PublicKey;
-    ammOpenOrders: PublicKey;
-    ammTargetOrders: PublicKey;
-    poolCoinTokenAccount: PublicKey;
-    poolPcTokenAccount: PublicKey;
-    serumProgramId: PublicKey;
-    serumMarket: PublicKey;
-    serumBids: PublicKey;
-    serumAsks: PublicKey;
-    serumEventQueue: PublicKey;
-    serumCoinVaultAccount: PublicKey;
-    serumPcVaultAccount: PublicKey;
-    serumVaultSigner: PublicKey;
-    userSourceTokenAccount: PublicKey | undefined;
-    userDestTokenAccount: PublicKey | undefined;
-    userAuthority: PublicKey | undefined;
-}
-
 export class SwapTracker {
     private connection: Connection;
     private walletAddress: string;
@@ -54,145 +34,74 @@ export class SwapTracker {
         };
     }
 
-    private extractRaydiumV4Accounts(tx: TransactionResponse | VersionedTransactionResponse): RaydiumV4Accounts | null {
-        try {
-            const raydiumV4ProgramId = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
-            
-            // Safely access message and instructions
-            const message = tx.transaction?.message;
-            if (!message || !message.compiledInstructions) {
-                logger.error('Transaction message or compiled instructions not found');
-                return null;
-            }
-
-
-            const staticAccounts = message.staticAccountKeys;
-
-            // Safely create PublicKeys with validation
-            const createSafePublicKey = (account: any, label: string): PublicKey | null => {
-                try {
-                    if (!account) {
-                        logger.error(`Missing account for ${label}`);
-                        return null;
-                    }
-                    return new PublicKey(account.toString());
-                } catch (error) {
-                    logger.error(`Error creating PublicKey for ${label}: ${error}`);
-                    return null;
-                }
-            };
-
-            const ammId = createSafePublicKey(staticAccounts[1], 'ammId');
-            const ammAuthority = createSafePublicKey(staticAccounts[3], 'ammAuthority');
-            const ammOpenOrders = createSafePublicKey(staticAccounts[2], 'ammOpenOrders');
-            const ammTargetOrders = createSafePublicKey(staticAccounts[4], 'ammTargetOrders');
-            const poolCoinTokenAccount = createSafePublicKey(staticAccounts[5], 'poolCoinTokenAccount');
-            const poolPcTokenAccount = createSafePublicKey(staticAccounts[6], 'poolPcTokenAccount');
-            const serumProgramId = createSafePublicKey(staticAccounts[8], 'serumProgramId');
-            const serumMarket = createSafePublicKey(staticAccounts[7], 'serumMarket');
-            const serumBids = createSafePublicKey(staticAccounts[9], 'serumBids');
-            const serumAsks = createSafePublicKey(staticAccounts[10], 'serumAsks');
-            const serumEventQueue = createSafePublicKey(staticAccounts[11], 'serumEventQueue');
-            const serumCoinVaultAccount = createSafePublicKey(staticAccounts[12], 'serumCoinVaultAccount');
-            const serumPcVaultAccount = createSafePublicKey(staticAccounts[13], 'serumPcVaultAccount');
-            const serumVaultSigner = createSafePublicKey(staticAccounts[14], 'serumVaultSigner');
-
-            // Verify all required accounts are present
-            if (!ammId || !ammAuthority || !ammOpenOrders || !ammTargetOrders || 
-                !poolCoinTokenAccount || !poolPcTokenAccount || !serumProgramId || 
-                !serumMarket || !serumBids || !serumAsks || !serumEventQueue || 
-                !serumCoinVaultAccount || !serumPcVaultAccount || !serumVaultSigner) {
-                logger.error('One or more required accounts are missing');
-                return null;
-            }
-
-            return {
-                ammId,
-                ammAuthority,
-                ammOpenOrders,
-                ammTargetOrders,
-                poolCoinTokenAccount,
-                poolPcTokenAccount,
-                serumProgramId,
-                serumMarket,
-                serumBids,
-                serumAsks,
-                serumEventQueue,
-                serumCoinVaultAccount,
-                serumPcVaultAccount,
-                serumVaultSigner,
-                userSourceTokenAccount: undefined,
-                userDestTokenAccount: undefined,
-                userAuthority: undefined,
-            };
-
-        } catch (error) {
-            logger.error(`Error extracting Raydium V4 accounts: ${error}`);
-            if (error instanceof Error) {
-                logger.error(`Stack trace: ${error.stack}`);
-            }
-            return null;
-        }
-    }
-
     private async analyzeTransaction(tx: TransactionResponse | VersionedTransactionResponse) {
         if (!tx.meta) return;
 
         const signature = tx.transaction.signatures[0];
         const timestamp = tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleString() : 'Unknown';
 
-        // Parse token balances
-        const preTokenBalances = tx.meta.preTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
-        const postTokenBalances = tx.meta.postTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
+        // Parse token balances with owner information
+        const preTokenBalances = tx.meta.preTokenBalances?.map(balance => ({
+            ...this.parseTokenBalances(balance),
+            owner: balance.owner
+        })).filter(Boolean) || [];
         
-        // Calculate token changes
-        const tokenChanges = postTokenBalances.map(post => {
-            const pre = preTokenBalances.find(p => p?.mint === post?.mint);
-            return {
-                mint: post?.mint,
-                change: (post?.uiAmount || 0) - (pre?.uiAmount || 0)
-            };
-        }).filter(change => change.change !== 0);
+        const postTokenBalances = tx.meta.postTokenBalances?.map(balance => ({
+            ...this.parseTokenBalances(balance),
+            owner: balance.owner
+        })).filter(Boolean) || [];
 
-        if (tokenChanges.length >= 2) {
-            const firstSend = tokenChanges[0];
-            const firstReceive = tokenChanges[1];
-
-            if (firstSend.change < 0 && firstReceive.change > 0) {
-                logger.info('\n🔄 Transaction Details:');
-                logger.info('------------------------');
-                logger.info(`Signature: ${signature}`);
-                logger.info(`Time: ${timestamp}`);
-                
-                logger.info('\n📊 Swap Details:');
-                logger.info(`📉 Sent: ${Math.abs(firstSend.change)} (${firstSend.mint})`);
-                logger.info(`📈 Received: ${firstReceive.change} (${firstReceive.mint})`);
-
-                const tradeDetails: TradeDetails = {
-                    tokenIn: {
-                        mint: firstSend.mint!,
-                        amount: Math.abs(firstSend.change)
-                    },
-                    tokenOut: {
-                        mint: firstReceive.mint!,
-                        amount: Math.abs(firstReceive.change)
-                    },
-                    signature,
-                    blockhash: tx.transaction.message.recentBlockhash,
-                    computeUnits: tx.meta.computeUnitsConsumed || 0,
-                    poolAddress: '' // We'll find this dynamically
+        // Get the wallet's token changes
+        const walletChanges = postTokenBalances
+            .filter(post => post.owner === this.walletAddress)
+            .map(post => {
+                const pre = preTokenBalances.find(p => p.mint === post.mint && p.owner === this.walletAddress);
+                return {
+                    mint: post.mint,
+                    change: (post.uiAmount || 0) - (pre?.uiAmount || 0)
                 };
+            })
+            .filter(change => Math.abs(change.change) > 0.000001);
 
-                await this.bot.handleTrade(tradeDetails);
-                logger.info('------------------------\n');
-            }
+        // Find the actual swap by looking for positive change (token received)
+        const tokenReceived = walletChanges.find(change => change.change > 0);
+        const tokenSent = walletChanges.find(change => change.change < 0);
+
+        if (tokenReceived && tokenSent) {
+            logger.info('\n🔄 Transaction Details:');
+            logger.info('------------------------');
+            logger.info(`Signature: ${signature}`);
+            logger.info(`Time: ${timestamp}`);
+            
+            logger.info('\n📊 Swap Details:');
+            logger.info(`📉 Sent: ${Math.abs(tokenSent.change)} (${tokenSent.mint})`);
+            logger.info(`📈 Received: ${tokenReceived.change} (${tokenReceived.mint})`);
+
+            const tradeDetails: TradeDetails = {
+                tokenIn: {
+                    mint: tokenSent.mint!,
+                    amount: Math.abs(tokenSent.change)
+                },
+                tokenOut: {
+                    mint: tokenReceived.mint!,
+                    amount: tokenReceived.change
+                },
+                signature: signature,
+                blockhash: tx.transaction.message.recentBlockhash,
+                computeUnits: tx.meta.computeUnitsConsumed || 0,
+                poolAddress: '',
+            };
+
+            await this.bot.handleTrade(tradeDetails);
+            logger.info('------------------------\n');
         }
     }
 
     async trackSwaps() {
         this.isTracking = true;
         logger.info(`🎯 Starting to track wallet: ${this.walletAddress}`);
-        let heartbeatCounter = 0;
+        let lastHeartbeat = Date.now();
+        const HEARTBEAT_INTERVAL = 30000; // 30 seconds
 
         try {
             const subscriptionId = this.connection.onLogs(
@@ -224,9 +133,12 @@ export class SwapTracker {
             logger.info('✅ Wallet tracking started successfully');
 
             while (this.isTracking) {
-                heartbeatCounter++;
-                logger.info(`💗 Scanning for trades... (Heartbeat #${heartbeatCounter})`);
-                await new Promise(resolve => setTimeout(resolve, 10000)); // Heartbeat every 10 seconds
+                const currentTime = Date.now();
+                if (currentTime - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+                    logger.info('💗 Wallet tracker heartbeat - Still monitoring transactions');
+                    lastHeartbeat = currentTime;
+                }
+                await new Promise(resolve => setTimeout(resolve, 500));
             }
 
             this.connection.removeOnLogsListener(subscriptionId);

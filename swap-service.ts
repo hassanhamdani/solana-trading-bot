@@ -1,4 +1,4 @@
-import { Connection, PublicKey, Transaction, Keypair, VersionedTransaction } from '@solana/web3.js';
+import { Connection, PublicKey, Transaction, Keypair, VersionedTransaction, sendAndConfirmTransaction } from '@solana/web3.js';
 import { logger } from './helpers';
 import axios from 'axios';
 import { API_URLS } from '@raydium-io/raydium-sdk-v2';
@@ -47,6 +47,13 @@ export class SwapService {
             logger.info(`Token In: ${tokenInMint}`);
             logger.info(`Token Out: ${tokenOutMint}`);
             
+            // If buying token with SOL, set minimum amount to 0.01 SOL
+            const minimumSolAmount = 0.001;
+            if (tokenInMint === 'So11111111111111111111111111111111111111112') {
+                amountIn = minimumSolAmount;
+                logger.info(`Setting minimum SOL amount to: ${minimumSolAmount} SOL`);
+            }
+            
             // Convert SOL to lamports (1 SOL = 1e9 lamports)
             const amountInLamports = Math.floor(amountIn * 1e9);
             logger.info(`Amount In (SOL): ${amountIn}`);
@@ -59,34 +66,30 @@ export class SwapService {
             let swapResponse;
 
             try {
-                const response = await axios.get(swapQuoteUrl);
-                swapResponse = response.data; // Save the response
+                const { data: response } = await axios.get(swapQuoteUrl);
+                // save const { data: response } to swapResponse
+                swapResponse = response;
                 
-                // Log the complete response for debugging
-                logger.info('Complete API Response:', {
-                    status: response.status,
-                    statusText: response.statusText,
-                    data: JSON.stringify(response.data, null, 2)
-                });
+                // // Log the complete response for debugging
+                // logger.info('Complete API Response:', {
+                //     status: response.status,
+                //     statusText: response.statusText,
+                //     data: JSON.stringify(response.data, null, 2)
+                // });
 
-                // Check if response has data property
-                if (!swapResponse) {
-                    throw new Error('No data received from Raydium API');
-                }
+                // // Validate specific expected properties
+                // if (!swapResponse.inputAmount) {
+                //     logger.error('Invalid response structure:', swapResponse);
+                //     throw new Error('Invalid response structure from Raydium API');
+                // }
 
-                // Validate specific expected properties
-                if (!swapResponse.amountIn) {
-                    logger.error('Invalid response structure:', swapResponse);
-                    throw new Error('Invalid response structure from Raydium API');
-                }
-
-                // Log the specific swap details we received
-                logger.info('Swap Quote Details:', {
-                    amountIn: swapResponse.amountIn,
-                    amountOut: swapResponse.amountOut,
-                    priceImpact: swapResponse.priceImpact,
-                    fee: swapResponse.fee
-                });
+                // // Log the specific swap details we received
+                // logger.info('Swap Quote Details:', {
+                //     inputAmount: swapResponse.inputAmount,
+                //     outputAmount: swapResponse.outputAmount,
+                //     priceImpact: swapResponse.priceImpactPct,
+                //     slippage: swapResponse.slippageBps
+                // });
 
             } catch (quoteError: any) {
                 logger.error('Quote Error Details:', {
@@ -106,61 +109,101 @@ export class SwapService {
 
             // 3. Build transaction via POST
             const buildTxUrl = `${API_URLS.SWAP_HOST}/transaction/swap-base-in`;
-            const { data: swapTransactions } = await axios.post(buildTxUrl, {
+            const isInputSol = tokenInMint === 'So11111111111111111111111111111111111111112';
+            const isOutputSol = tokenOutMint === 'So11111111111111111111111111111111111111112';
+
+            const { data: swapTransactions } = await axios.post<{
+                id: string;
+                version: string;
+                success: boolean;
+                data: { transaction: string }[];
+            }>(`${API_URLS.SWAP_HOST}/transaction/swap-base-in`, {
                 computeUnitPriceMicroLamports: computeUnitPrice,
                 swapResponse,
                 txVersion: 'V0',
                 wallet: this.userWallet.publicKey.toBase58(),
-                wrapSol: tokenInMint === 'So11111111111111111111111111111111111111112',
-                unwrapSol: tokenOutMint === 'So11111111111111111111111111111111111111112',
+                wrapSol: isInputSol,
+                unwrapSol: isOutputSol,
+                inputAccount: isInputSol ? undefined : undefined,
+                outputAccount: isOutputSol ? undefined : undefined,
             });
 
-            // 4. Process transactions
-            const allTxBuf = swapTransactions.data.map((tx: any) => 
+            // Add detailed logging of the response
+            logger.info('Build transaction response:', JSON.stringify(swapTransactions, null, 2));
+
+            if (!swapTransactions.success || !swapTransactions.data) {
+                throw new Error('Failed to build swap transaction');
+            }
+
+            // 4. Process transactions with better error handling and logging
+            const allTxBuf = swapTransactions.data.map(tx => 
                 Buffer.from(tx.transaction, 'base64')
             );
-            const isV0 = swapTransactions.version === 'V0';
 
-            // Track all signatures for return value
+            logger.info(`Transaction version from Raydium: ${swapTransactions.version}`);
             const signatures: string[] = [];
 
-            // 5. Process each transaction
-            for (let i = 0; i < allTxBuf.length; i++) {
-                const txBuf = allTxBuf[i];
-                const tx = isV0 
-                    ? VersionedTransaction.deserialize(txBuf)
-                    : Transaction.from(txBuf);
+            // Helper function to safely parse transactions
+            const parseTx = (buf: Buffer) => {
+                try {
+                    return VersionedTransaction.deserialize(buf);
+                } catch (e) {
+                    logger.warn('Failed to parse as VersionedTransaction, falling back to Legacy Transaction');
+                    return Transaction.from(buf);
+                }
+            };
 
-                if (isV0) {
-                    (tx as VersionedTransaction).sign([this.userWallet]);
-                    const txId = await this.connection.sendTransaction(tx as VersionedTransaction, {
-                        skipPreflight: false,
-                        maxRetries: 3
-                    });
-                    signatures.push(txId);
+            // Parse and process each transaction
+            const allTransactions = allTxBuf.map(buf => parseTx(buf));
 
-                    // Confirm transaction
-                    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
-                    await this.connection.confirmTransaction({
-                        blockhash,
-                        lastValidBlockHeight,
-                        signature: txId
-                    });
-                    logger.info(`Transaction ${i + 1}/${allTxBuf.length} confirmed: ${txId}`);
-                } else {
-                    (tx as Transaction).sign(this.userWallet);
-                    const txId = await this.connection.sendTransaction(tx as Transaction, [this.userWallet], {
-                        skipPreflight: false,
-                        maxRetries: 3
-                    });
-                    signatures.push(txId);
-                    
-                    await this.connection.confirmTransaction(txId, 'confirmed');
-                    logger.info(`Transaction ${i + 1}/${allTxBuf.length} confirmed: ${txId}`);
+            let idx = 0;
+            for (const tx of allTransactions) {
+                idx++;
+                logger.info(`Processing transaction ${idx}/${allTransactions.length}`);
+
+                try {
+                    if (tx instanceof VersionedTransaction) {
+                        tx.sign([this.userWallet]);
+                        
+                        const txId = await this.connection.sendTransaction(tx, {
+                            skipPreflight: true,
+                            maxRetries: 3
+                        });
+                        signatures.push(txId);
+
+                        const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash({
+                            commitment: 'finalized'
+                        });
+
+                        logger.info(`Versioned transaction ${idx} sending..., txId: ${txId}`);
+                        await this.connection.confirmTransaction(
+                            {
+                                blockhash,
+                                lastValidBlockHeight,
+                                signature: txId,
+                            },
+                            'confirmed'
+                        );
+                        logger.info(`Versioned transaction ${idx} confirmed`);
+                    } else {
+                        const txId = await sendAndConfirmTransaction(
+                            this.connection,
+                            tx as Transaction,
+                            [this.userWallet],
+                            {
+                                skipPreflight: true,
+                                maxRetries: 3
+                            }
+                        );
+                        signatures.push(txId);
+                        logger.info(`Legacy transaction ${idx} confirmed, txId: ${txId}`);
+                    }
+                } catch (txError) {
+                    logger.error(`Error processing transaction ${idx}:`, txError);
+                    throw txError;
                 }
             }
 
-            // Return the first signature (or concatenated signatures if multiple)
             return signatures.join(',');
 
         } catch (error) {

@@ -19,7 +19,7 @@ export interface TradeDetails {
     blockhash: string;
     computeUnits: number;
     poolAddress: string;
-  }
+}
 
 export class CopyTradingBot {
     private connection: Connection;

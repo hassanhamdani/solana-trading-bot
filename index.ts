@@ -1,3 +1,4 @@
+import './server';
 import { Connection } from '@solana/web3.js';
 import { logger, COMMITMENT_LEVEL, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT, LOG_LEVEL } from './helpers';
 import { SwapTracker } from './wallet-copier';

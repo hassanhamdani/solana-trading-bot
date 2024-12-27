@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Swap Tracker Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+    <div class="dashboard">
+        <header>
+            <h1>Swap Tracker Dashboard</h1>
+            <div class="stats">
+                <div class="stat-box">
+                    <span class="stat-label">Total Swaps</span>
+                    <span class="stat-value" id="totalSwaps">0</span>
+                </div>
+                <div class="stat-box">
+                    <span class="stat-label">Success Rate</span>
+                    <span class="stat-value" id="successRate">0%</span>
+                </div>
+            </div>
+        </header>
+        
+        <main>
+            <div class="logs-container">
+                <div class="logs" id="logs"></div>
+            </div>
+            
+            <div class="active-trades">
+                <h2>Recent Trades</h2>
+                <div id="trades-list"></div>
+            </div>
+        </main>
+    </div>
+    <script src="dashboard.js"></script>
+</body>
+</html> 
