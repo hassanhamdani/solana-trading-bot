@@ -6,6 +6,7 @@ import { Buffer } from 'buffer';
 import { RaydiumV4Accounts } from './bot';
 import bs58 from 'bs58';
 import nacl from 'tweetnacl';
+import { ComputeBudgetProgram } from '@solana/web3.js';
 
 type SwapInstruction = {
     instruction: number;
@@ -213,7 +214,6 @@ export class SwapService {
             if (!account) {
                 logger.info(`Creating token account for mint: ${mint.toString()}`);
                 
-                // Create the account if it doesn't exist
                 const createAtaIx = createAssociatedTokenAccountInstruction(
                     this.userWallet.publicKey, // payer
                     associatedTokenAddress, // ata
@@ -221,8 +221,22 @@ export class SwapService {
                     mint // mint
                 );
 
-                const transaction = new Transaction().add(createAtaIx);
-                
+                const transaction = new Transaction();
+
+                // Add priority fee for ATA creation
+                // ATA creation typically uses less compute units than swaps
+                const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({
+                    microLamports: 25000 // Slightly lower than swap priority fee
+                });
+
+                const computeUnitLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
+                    units: 25000 // ATA creation usually needs less CU than swaps
+                });
+
+                transaction.add(priorityFeeIx);
+                transaction.add(computeUnitLimitIx);
+                transaction.add(createAtaIx);
+
                 // Get a fresh blockhash
                 const latestBlockhash = await this.connection.getLatestBlockhash('finalized');
                 transaction.recentBlockhash = latestBlockhash.blockhash;
@@ -424,7 +438,7 @@ export class SwapService {
                     
                     // Serum Accounts
                     { pubkey: accounts.serumMarket, isSigner: false, isWritable: true },
-                    { pubkey: accounts.serumProgramId, isSigner: false, isWritable: false },
+                    { pubkey: new PublicKey('9xQeWvG816bUx9CEPZ6tWx3i1G7NbELTAgf8rLj4tBe'), isSigner: false, isWritable: false },
                     { pubkey: accounts.serumBids, isSigner: false, isWritable: true },
                     { pubkey: accounts.serumAsks, isSigner: false, isWritable: true },
                     { pubkey: accounts.serumEventQueue, isSigner: false, isWritable: true },
@@ -442,16 +456,31 @@ export class SwapService {
             });
 
             const transaction = new Transaction();
-            transaction.add(swapIx);
             
+            // Add priority fee instruction
+            const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({
+                microLamports: 30000 // Adjust this value to increase/decrease priority
+            });
+            
+            // Add compute unit limit instruction (optional but recommended)
+            const computeUnitLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
+                units: 100000 // Adjust based on your transaction needs
+            });
+
+            transaction.add(priorityFeeIx);
+            transaction.add(computeUnitLimitIx);
+            transaction.add(swapIx);
+
             const latestBlockhash = await this.connection.getLatestBlockhash('finalized');
             transaction.recentBlockhash = latestBlockhash.blockhash;
             transaction.lastValidBlockHeight = latestBlockhash.lastValidBlockHeight;
             transaction.feePayer = this.userWallet.publicKey;
 
-            // Sign and send immediately to minimize staleness
-            const signature = await this.connection.sendRawTransaction(
-                transaction.serialize(),
+            transaction.sign(this.userWallet);
+
+            const signature = await this.connection.sendTransaction(
+                transaction,
+                [this.userWallet],
                 {
                     skipPreflight: false,
                     preflightCommitment: 'confirmed',

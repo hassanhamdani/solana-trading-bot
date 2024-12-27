@@ -140,6 +140,24 @@ export class SwapTracker {
 
         const signature = tx.transaction.signatures[0];
         const timestamp = tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleString() : 'Unknown';
+        try {
+            await fs.writeFile(
+                `swap-${signature}.json`,
+                JSON.stringify(tx, null, 2)
+            );
+        } catch (error) {
+            logger.error(`Error saving transaction log: ${error}`);
+        }
+
+        // Calculate priority fee in SOL
+        const priorityFee = tx.meta?.computeUnitsConsumed 
+            ? (tx.meta.fee / Math.pow(10, 9)) - ((tx.meta.computeUnitsConsumed * 5000) / Math.pow(10, 9))
+            : 0;
+
+        // If you want to get priority fee per compute unit (in SOL):
+        const priorityFeePerCU = priorityFee > 0 && tx.meta?.computeUnitsConsumed 
+            ? priorityFee / tx.meta.computeUnitsConsumed
+            : 0;
 
         // Parse token balances
         const preTokenBalances = tx.meta.preTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
@@ -163,6 +181,7 @@ export class SwapTracker {
                 logger.info('------------------------');
                 logger.info(`Signature: ${signature}`);
                 logger.info(`Time: ${timestamp}`);
+                logger.info(`Priority Fee: ${priorityFee} SOL`);
                 
                 // Only log the relevant swap
                 logger.info('\n📊 Swap Details:');
