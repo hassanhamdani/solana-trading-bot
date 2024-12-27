@@ -12,7 +12,19 @@ const connection = new Connection(RPC_ENDPOINT, {
     },
 });
 
+// Add connection check
+const checkConnection = async () => {
+    try {
+        await connection.getLatestBlockhash();
+        logger.info('RPC connection established successfully');
+    } catch (error) {
+        logger.error('Failed to connect to RPC:', error);
+        process.exit(1);
+    }
+};
+
 const runSwapTracker = async () => {
+    await checkConnection(); // Add connection check
     logger.level = LOG_LEVEL;
     logger.info('Swap tracker is starting...');
 

@@ -19,28 +19,7 @@ export interface TradeDetails {
     blockhash: string;
     computeUnits: number;
     poolAddress: string;
-    raydiumAccounts: RaydiumV4Accounts;
-}
-
-export interface RaydiumV4Accounts {
-    ammId: PublicKey;
-    ammAuthority: PublicKey;
-    ammOpenOrders: PublicKey;
-    ammTargetOrders: PublicKey;
-    poolCoinTokenAccount: PublicKey;
-    poolPcTokenAccount: PublicKey;
-    serumProgramId: PublicKey;
-    serumMarket: PublicKey;
-    serumBids: PublicKey;
-    serumAsks: PublicKey;
-    serumEventQueue: PublicKey;
-    serumCoinVaultAccount: PublicKey;
-    serumPcVaultAccount: PublicKey;
-    serumVaultSigner: PublicKey;
-    userSourceTokenAccount?: PublicKey | undefined;
-    userDestTokenAccount?: PublicKey | undefined;
-    userAuthority?: PublicKey | undefined;
-}
+  }
 
 export class CopyTradingBot {
     private connection: Connection;
@@ -72,8 +51,8 @@ export class CopyTradingBot {
         this.handleTrade = this.handleTrade.bind(this);
     }
 
-    private async executeSwap(tokenIn: string, tokenOut: string, amount: number, poolAddress?: string, raydiumAccounts?: RaydiumV4Accounts): Promise<string | null> {
-        return await this.swapService.executeSwap(tokenIn, tokenOut, amount, poolAddress, raydiumAccounts);
+    private async executeSwap(tokenIn: string, tokenOut: string, amount: number, poolAddress?: string): Promise<string | null> {
+        return await this.swapService.executeSwap(tokenIn, tokenOut, amount, poolAddress);
     }
 
     public async handleTrade(tx: TradeDetails) {
@@ -89,22 +68,10 @@ export class CopyTradingBot {
                 }
             }, null, 2));
             
-            // Determine if this is a buy or sell
-            const isSol = (mint: string) => mint === this.WSOL_MINT;
-            const isUSDC = (mint: string) => mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-            const isSOLorUSDC = (mint: string) => isSol(mint) || isUSDC(mint);
-
-            const targetIsBuying = isSOLorUSDC(tx.tokenIn.mint);
-            logger.info(`Target wallet is ${targetIsBuying ? 'BUYING' : 'SELLING'}`);
-
-            // For buys: we want to use the same input token as the target
-            // For sells: we want to use the same output token as the target
-            const signature = await this.executeSwap(
+            const signature = await this.swapService.executeSwap(
                 tx.tokenIn.mint,
                 tx.tokenOut.mint,
-                tx.tokenIn.amount,
-                tx.poolAddress,
-                tx.raydiumAccounts
+                tx.tokenIn.amount
             );
             
             if (signature) {

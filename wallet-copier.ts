@@ -140,24 +140,6 @@ export class SwapTracker {
 
         const signature = tx.transaction.signatures[0];
         const timestamp = tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleString() : 'Unknown';
-        try {
-            await fs.writeFile(
-                `swap-${signature}.json`,
-                JSON.stringify(tx, null, 2)
-            );
-        } catch (error) {
-            logger.error(`Error saving transaction log: ${error}`);
-        }
-
-        // Calculate priority fee in SOL
-        const priorityFee = tx.meta?.computeUnitsConsumed 
-            ? (tx.meta.fee / Math.pow(10, 9)) - ((tx.meta.computeUnitsConsumed * 5000) / Math.pow(10, 9))
-            : 0;
-
-        // If you want to get priority fee per compute unit (in SOL):
-        const priorityFeePerCU = priorityFee > 0 && tx.meta?.computeUnitsConsumed 
-            ? priorityFee / tx.meta.computeUnitsConsumed
-            : 0;
 
         // Parse token balances
         const preTokenBalances = tx.meta.preTokenBalances?.map(this.parseTokenBalances).filter(Boolean) || [];
@@ -181,35 +163,27 @@ export class SwapTracker {
                 logger.info('------------------------');
                 logger.info(`Signature: ${signature}`);
                 logger.info(`Time: ${timestamp}`);
-                logger.info(`Priority Fee: ${priorityFee} SOL`);
                 
-                // Only log the relevant swap
                 logger.info('\n📊 Swap Details:');
                 logger.info(`📉 Sent: ${Math.abs(firstSend.change)} (${firstSend.mint})`);
                 logger.info(`📈 Received: ${firstReceive.change} (${firstReceive.mint})`);
 
-                const raydiumAccounts = this.extractRaydiumV4Accounts(tx);
-                
-                if (raydiumAccounts) {
-                    const tradeDetails: TradeDetails = {
-                        tokenIn: {
-                            mint: firstSend.mint!,
-                            amount: Math.abs(firstSend.change)
-                        },
-                        tokenOut: {
-                            mint: firstReceive.mint!,
-                            amount: Math.abs(firstReceive.change)
-                        },
-                        signature: signature,
-                        blockhash: tx.transaction.message.recentBlockhash,
-                        computeUnits: tx.meta.computeUnitsConsumed || 0,
-                        poolAddress: raydiumAccounts.ammId.toString(),
-                        raydiumAccounts
-                    };
+                const tradeDetails: TradeDetails = {
+                    tokenIn: {
+                        mint: firstSend.mint!,
+                        amount: Math.abs(firstSend.change)
+                    },
+                    tokenOut: {
+                        mint: firstReceive.mint!,
+                        amount: Math.abs(firstReceive.change)
+                    },
+                    signature,
+                    blockhash: tx.transaction.message.recentBlockhash,
+                    computeUnits: tx.meta.computeUnitsConsumed || 0,
+                    poolAddress: '' // We'll find this dynamically
+                };
 
-                    await this.bot.handleTrade(tradeDetails);
-                }
-
+                await this.bot.handleTrade(tradeDetails);
                 logger.info('------------------------\n');
             }
         }
@@ -218,6 +192,7 @@ export class SwapTracker {
     async trackSwaps() {
         this.isTracking = true;
         logger.info(`🎯 Starting to track wallet: ${this.walletAddress}`);
+        let heartbeatCounter = 0;
 
         try {
             const subscriptionId = this.connection.onLogs(
@@ -249,7 +224,9 @@ export class SwapTracker {
             logger.info('✅ Wallet tracking started successfully');
 
             while (this.isTracking) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                heartbeatCounter++;
+                logger.info(`💗 Scanning for trades... (Heartbeat #${heartbeatCounter})`);
+                await new Promise(resolve => setTimeout(resolve, 10000)); // Heartbeat every 10 seconds
             }
 
             this.connection.removeOnLogsListener(subscriptionId);
