@@ -83,10 +83,10 @@ main {
 }
 
 .log-entry {
-    padding: 8px 12px;
-    border-left: 3px solid transparent;
-    margin-bottom: 4px;
-    animation: fadeIn 0.3s ease-in-out;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    margin-bottom: 8px;
+    background-color: #1a1a1a;
 }
 
 .log-entry.info { border-left-color: var(--accent); }
@@ -106,7 +106,88 @@ main {
 }
 
 .timestamp {
-    color: var(--text-secondary);
+    color: #888;
     font-size: 0.8em;
+}
+
+.log-header {
+    padding: 12px;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background-color: #2a2a2a;
+}
+
+.log-header:hover {
+    background-color: #333;
+}
+
+.log-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: monospace;
+}
+
+.chevron {
+    transition: transform 0.3s ease;
+}
+
+.chevron.expanded {
+    transform: rotate(180deg);
+}
+
+.log-content {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease-out;
+    padding: 0 12px;
+}
+
+.log-content.expanded {
+    max-height: 1000px;
+    padding: 12px;
+}
+
+.log-message {
+    margin: 4px 0;
+    font-family: monospace;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.signature {
+    font-family: monospace;
+    font-size: 0.9em;
+}
+
+.timestamp {
+    color: #888;
+    font-size: 0.8em;
+}
+
+.trade-type {
+    font-weight: bold;
+    padding: 2px 6px;
+    border-radius: 4px;
     margin-right: 8px;
+}
+
+.trade-type.buy {
+    color: #4caf50;
+    background-color: rgba(76, 175, 80, 0.1);
+}
+
+.trade-type.sell {
+    color: #f44336;
+    background-color: rgba(244, 67, 54, 0.1);
+}
+
+.signature.buy {
+    color: #4caf50;
+}
+
+.signature.sell {
+    color: #f44336;
 } 
