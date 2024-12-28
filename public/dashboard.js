@@ -6,6 +6,9 @@ const successRateSpan = document.getElementById('successRate');
 let currentLogGroup = null;
 let totalSwaps = 0;
 let successfulSwaps = 0;
+let pendingMessages = [];
+let currentSwapType = 'unknown';
+let currentSignature = null;
 
 function updateStats() {
     totalSwapsSpan.textContent = totalSwaps;
@@ -13,7 +16,10 @@ function updateStats() {
     successRateSpan.textContent = `${rate.toFixed(1)}%`;
 }
 
-function createLogGroup(signature, timestamp, message) {
+function createLogGroup(signature, timestamp, swapType) {
+    // Clear any pending messages that don't belong to this signature
+    pendingMessages = pendingMessages.filter(msg => !msg.includes('Signature:') || msg.includes(signature));
+    
     const logEntry = document.createElement('div');
     logEntry.className = 'log-entry';
 
@@ -26,21 +32,12 @@ function createLogGroup(signature, timestamp, message) {
     const chevron = document.createElement('i');
     chevron.className = 'fas fa-chevron-down chevron';
     
-    // Determine if it's a buy or sell
-    const isBuy = message.includes('So11111111111111111111111111111111111111112') && 
-                 message.includes('📉 Sent:') && 
-                 message.includes('So11111111111111111111111111111111111111112');
-    
-    const isSell = message.includes('So11111111111111111111111111111111111111112') && 
-                  message.includes('📈 Received:') && 
-                  message.includes('So11111111111111111111111111111111111111112');
-
     const typeSpan = document.createElement('span');
-    typeSpan.className = `trade-type ${isBuy ? 'buy' : 'sell'}`;
-    typeSpan.textContent = isBuy ? '[BUY]' : '[SELL]';
+    typeSpan.className = `trade-type ${swapType}`;
+    typeSpan.textContent = swapType === 'buy' ? '[BUY]' : swapType === 'sell' ? '[SELL]' : '[SWAP]';
     
     const signatureSpan = document.createElement('span');
-    signatureSpan.className = `signature ${isBuy ? 'buy' : 'sell'}`;
+    signatureSpan.className = `signature ${swapType}`;
     signatureSpan.textContent = signature;
     
     const timestampSpan = document.createElement('span');
@@ -65,6 +62,15 @@ function createLogGroup(signature, timestamp, message) {
     logEntry.appendChild(content);
     logsDiv.insertBefore(logEntry, logsDiv.firstChild);
 
+    // Add pending messages
+    pendingMessages.forEach(msg => {
+        const logMessage = document.createElement('div');
+        logMessage.className = 'log-message';
+        logMessage.textContent = msg;
+        content.appendChild(logMessage);
+    });
+    pendingMessages = []; // Clear pending messages after adding them
+
     return content;
 }
 
@@ -72,11 +78,32 @@ socket.on('log', (data) => {
     const message = data.message;
     const timestamp = new Date(data.timestamp);
 
-    // Check if this is a new signature
+    // Check for new signature first
     const signatureMatch = message.match(/Signature: ([a-zA-Z0-9]+)/);
     if (signatureMatch) {
-        currentLogGroup = createLogGroup(signatureMatch[1], timestamp, message);
+        const newSignature = signatureMatch[1];
+        if (newSignature !== currentSignature) {
+            // Clear pending messages when we detect a new signature
+            pendingMessages = [];
+            currentSignature = newSignature;
+        }
+    }
+
+    // Check for swap type
+    const swapTypeMatch = message.match(/Swap Type: (BUY|SELL)/);
+    if (swapTypeMatch) {
+        currentSwapType = swapTypeMatch[1].toLowerCase();
+    }
+
+    // Store message for later display
+    pendingMessages.push(message);
+
+    // Create new log group if this is a signature message
+    if (signatureMatch) {
+        currentLogGroup = createLogGroup(signatureMatch[1], timestamp, currentSwapType);
         totalSwaps++;
+        currentSwapType = 'unknown'; // Reset for next group
+        return;
     }
 
     // Check for successful swap
@@ -84,7 +111,8 @@ socket.on('log', (data) => {
         successfulSwaps++;
     }
 
-    if (currentLogGroup) {
+    // If we have an active log group but no signature match, append to current group
+    if (currentLogGroup && !signatureMatch) {
         const logMessage = document.createElement('div');
         logMessage.className = 'log-message';
         logMessage.textContent = message;
