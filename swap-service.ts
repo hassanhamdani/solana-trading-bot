@@ -9,11 +9,12 @@ import { fetchAllDigitalAssetByOwner } from '@metaplex-foundation/mpl-token-meta
 
 dotenv.config(); // Load environment variables
 
-let ENABLE_BUY = true;  // Control buying (SOL -> Token)
+let ENABLE_BUY = false;  // Control buying (SOL -> Token)
 let ENABLE_SELL = true; // Control selling (Token -> SOL)
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000; // 1 second delay between retries
+const EMERGENCY_SLIPPAGE_BPS = 5000; // 50% slippage for emergency sells
 
 export class SwapService {
     private connection: Connection;
@@ -57,7 +58,16 @@ export class SwapService {
     ): Promise<string | null> {
         let retryCount = 0;
         const isBuyTransaction = tokenInMint === 'So11111111111111111111111111111111111111112';
-        
+        const isSellTransaction = tokenOutMint === 'So11111111111111111111111111111111111111112';
+
+        // Early exit without logging if transaction type is disabled
+        if ((isBuyTransaction && !ENABLE_BUY) || (isSellTransaction && !ENABLE_SELL)) {
+            return null;
+        }
+
+        // Only log swap type if the transaction type is enabled
+        logger.info(`Swap Type: ${isBuyTransaction ? 'BUY' : 'SELL'}`);
+
         while (retryCount <= MAX_RETRIES) {
             try {
                 // Add buy/sell control check at the start
@@ -160,20 +170,6 @@ export class SwapService {
                     // Calculate our sell amount
                     let ourSellAmount = (ourCurrentBalance * targetSellPercentage) / 100;
 
-                    // Get token price in SOL for minimum value check
-                    try {
-                        const { data: priceData } = await axios.get(
-                            `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenInMint}&outputMint=${tokenOutMint}&amount=${Math.floor(ourSellAmount)}&slippageBps=2300`
-                        );
-                        
-                        const expectedSolOutput = priceData.outputAmount / 1e9; // Convert lamports to SOL
-                        
-
-                    } catch (error) {
-                        logger.error('Failed to check minimum transaction value:', error);
-                        return null;
-                    }
-
                     // Round to appropriate decimal places based on token decimals
                     const tokenDecimals = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.decimals;
                     ourSellAmount = Math.floor(ourSellAmount); // Ensure we have a whole number of base units
@@ -218,26 +214,6 @@ export class SwapService {
                     // save const { data: response } to swapResponse
                     swapResponse = response;
                     
-                    // // Log the complete response for debugging
-                    // logger.info('Complete API Response:', {
-                    //     status: response.status,
-                    //     statusText: response.statusText,
-                    //     data: JSON.stringify(response.data, null, 2)
-                    // });
-
-                    // // Validate specific expected properties
-                    // if (!swapResponse.inputAmount) {
-                    //     logger.error('Invalid response structure:', swapResponse);
-                    //     throw new Error('Invalid response structure from Raydium API');
-                    // }
-
-                    // // Log the specific swap details we received
-                    // logger.info('Swap Quote Details:', {
-                    //     inputAmount: swapResponse.inputAmount,
-                    //     outputAmount: swapResponse.outputAmount,
-                    //     priceImpact: swapResponse.priceImpactPct,
-                    //     slippage: swapResponse.slippageBps
-                    // });
 
                 } catch (quoteError: any) {
                     logger.error('Quote Error Details:', {
@@ -378,9 +354,15 @@ export class SwapService {
                 }
                 
                 logger.error(`${transactionType} transaction failed after ${MAX_RETRIES} attempts:`, error);
-                if (error) {
-                    logger.error('API Error details:', JSON.stringify(error, null, 2));
+                
+                // Trigger emergency sell if this was a failed sell transaction
+                if (isSellTransaction) {
+                    logger.warn('Initiating emergency sell protocol...');
+                    this.triggerEmergencySell(tokenInMint).catch(emergencyError => {
+                        logger.error('Emergency sell also failed:', emergencyError);
+                    });
                 }
+                
                 return null;
             }
         }
@@ -409,6 +391,82 @@ export class SwapService {
         }
     }
 
+    private async triggerEmergencySell(tokenMint: string): Promise<void> {
+        try {
+            // Get the entire balance of the token
+            const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                this.userWallet.publicKey,
+                { mint: new PublicKey(tokenMint) }
+            );
+
+            if (!tokenAccounts.value.length) {
+                logger.error('Emergency sell: No token account found');
+                return;
+            }
+
+            const balance = Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
+            if (balance <= 0) {
+                logger.error('Emergency sell: Zero balance');
+                return;
+            }
+
+            logger.info(`Emergency sell: Attempting to sell entire balance of ${balance} tokens`);
+
+            // Get quote with higher slippage
+            const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=${balance}&slippageBps=${EMERGENCY_SLIPPAGE_BPS}&txVersion=V0`;
+            
+            const { data: swapResponse } = await axios.get(swapQuoteUrl);
+
+            // Get max priority fees
+            const { data: priorityFeeData } = await axios.get(`${API_URLS.BASE_HOST}${API_URLS.PRIORITY_FEE}`);
+            const computeUnitPrice = String(Math.floor(priorityFeeData.data.default.h)); // Double the high priority fee
+
+            // Build and execute emergency transaction
+            const buildTxUrl = `${API_URLS.SWAP_HOST}/transaction/swap-base-in`;
+            const { data: swapTransactions } = await axios.post(buildTxUrl, {
+                computeUnitPriceMicroLamports: computeUnitPrice,
+                swapResponse,
+                txVersion: 'V0',
+                wallet: this.userWallet.publicKey.toBase58(),
+                wrapSol: false,
+                unwrapSol: true,
+                inputAccount: (await this.getOrCreateAssociatedTokenAccount(tokenMint)).toBase58(),
+            });
+
+            if (!swapTransactions.success || !swapTransactions.data) {
+                throw new Error('Failed to build emergency swap transaction');
+            }
+
+            // Execute the emergency transaction
+            for (const tx of swapTransactions.data) {
+                const txBuf = Buffer.from(tx.transaction, 'base64');
+                const transaction = VersionedTransaction.deserialize(txBuf);
+                transaction.sign([this.userWallet]);
+                
+                const txId = await this.connection.sendTransaction(transaction, {
+                    skipPreflight: true,
+                    maxRetries: 5
+                });
+
+                logger.info(`Emergency sell transaction sent: ${txId}`);
+                
+                const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+                await this.connection.confirmTransaction(
+                    {
+                        blockhash,
+                        lastValidBlockHeight,
+                        signature: txId,
+                    },
+                    'confirmed'
+                );
+                logger.info('Emergency sell transaction confirmed');
+            }
+        } catch (error) {
+            logger.error('Emergency sell failed:', error);
+            throw error;
+        }
+    }
+
     // Add methods to control BUY/SELL settings
     static enableBuying(enable: boolean) {
         ENABLE_BUY = enable;
@@ -418,5 +476,44 @@ export class SwapService {
     static enableSelling(enable: boolean) {
         ENABLE_SELL = enable;
         logger.info(`Selling ${enable ? 'enabled' : 'disabled'}`);
+    }
+
+    // Add helper method to verify transaction success
+    public async verifyTransactionSuccess(signature: string): Promise<boolean> {
+        try {
+            const tx = await this.connection.getTransaction(signature, {
+                commitment: 'confirmed',
+                maxSupportedTransactionVersion: 0
+            });
+
+            if (!tx) {
+                logger.error(`Transaction ${signature} not found`);
+                return false;
+            }
+
+            if (tx.meta?.err) {
+                logger.error(`Transaction ${signature} failed with error:`, tx.meta.err);
+                return false;
+            }
+
+            // Check for specific program errors in logs
+            const logs = tx.meta?.logMessages || [];
+            const hasError = logs.some(log => 
+                log.includes('Error') || 
+                log.includes('Failed') || 
+                log.includes('Instruction #') || 
+                log.includes('Program Error')
+            );
+
+            if (hasError) {
+                logger.error(`Transaction ${signature} contains error in logs:`, logs);
+                return false;
+            }
+
+            return true;
+        } catch (error) {
+            logger.error(`Error verifying transaction ${signature}:`, error);
+            return false;
+        }
     }
 } 

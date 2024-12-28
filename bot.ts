@@ -75,9 +75,36 @@ export class CopyTradingBot {
             );
             
             if (signature) {
-                logger.info(`✅ Successfully copied trade!`);
-                logger.info(`Transaction signature: ${signature}`);
-                logger.info(`Solscan: https://solscan.io/tx/${signature}`);
+                // Verify transaction success
+                const isSuccess = await this.swapService.verifyTransactionSuccess(signature);
+                
+                if (isSuccess) {
+                    logger.info(`✅ Successfully copied trade!`);
+                    logger.info(`Transaction signature: ${signature}`);
+                    logger.info(`Solscan: https://solscan.io/tx/${signature}`);
+                } else {
+                    logger.warn(`⚠️ Initial transaction failed, attempting retry...`);
+                    
+                    // Retry the swap
+                    const retrySignature = await this.swapService.executeSwap(
+                        tx.tokenIn.mint,
+                        tx.tokenOut.mint,
+                        tx.tokenIn.amount
+                    );
+                    
+                    if (retrySignature) {
+                        const retrySuccess = await this.swapService.verifyTransactionSuccess(retrySignature);
+                        if (retrySuccess) {
+                            logger.info(`✅ Retry successful!`);
+                            logger.info(`Transaction signature: ${retrySignature}`);
+                            logger.info(`Solscan: https://solscan.io/tx/${retrySignature}`);
+                        } else {
+                            logger.error(`❌ Retry also failed`);
+                        }
+                    } else {
+                        logger.error(`❌ Retry failed to execute`);
+                    }
+                }
             } else {
                 logger.error('Failed to execute swap');
             }
