@@ -18,6 +18,10 @@ let ENABLE_SELL = true; // Control selling (Token -> SOL)
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000; // 1 second delay between retries
 const EMERGENCY_SLIPPAGE_BPS = 5000; // 50% slippage for emergency sells
+const BASE_SLIPPAGE_BPS = 3000; // 25% base slippage
+const MAX_SLIPPAGE_BPS = 4900;  // 49% max slippage
+const SLIPPAGE_INCREMENT = 500; // 5% increment per retry
+const MAX_ACCEPTABLE_PRICE_IMPACT = 100; // 100%
 
 interface PendingSell {
     mint: string;
@@ -25,6 +29,13 @@ interface PendingSell {
     attempts: number;
     lastAttempt: number;
     targetWallet: string;
+}
+
+export class ExtremePriceImpactError extends Error {
+    constructor(public priceImpact: number, public mint: string) {
+        super(`Extreme price impact of ${priceImpact}% detected for ${mint}`);
+        this.name = 'ExtremePriceImpactError';
+    }
 }
 
 export class SwapService {
@@ -126,13 +137,13 @@ export class SwapService {
 
                     if (!tokenAccounts.value.length) {
                         logger.error(`Cannot execute sell: We don't own token ${tokenInMint}`);
-                        return null;
+                        return null;  // Return here without adding to pending sells
                     }
 
                     const ourBalance = Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
                     if (ourBalance <= 0) {
                         logger.error(`Cannot execute sell: Zero balance for token ${tokenInMint}`);
-                        return null;
+                        return null;  // Return here without adding to pending sells
                     }
 
                     logger.info(`Found token ${tokenInMint} in our wallet with balance: ${ourBalance}`);
@@ -208,34 +219,53 @@ export class SwapService {
                 logger.info(`Amount In (SOL): ${amountIn}`);
                 logger.info(`Amount In (lamports): ${amountInLamports}`);
 
-                // 1. Get quote from Raydium API
-                const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenInMint}&outputMint=${tokenOutMint}&amount=${amountInLamports}&slippageBps=2300&txVersion=V0`;
-                
-                logger.info(`Fetching quote from: ${swapQuoteUrl}`);
-                let swapResponse;
+                // Calculate dynamic slippage based on retry count and whether it's a sell
+                const currentSlippage = isSellingTransaction 
+                    ? Math.min(BASE_SLIPPAGE_BPS + (retryCount * SLIPPAGE_INCREMENT), MAX_SLIPPAGE_BPS)
+                    : BASE_SLIPPAGE_BPS;
 
+                logger.info(`Using slippage: ${currentSlippage} bps (${currentSlippage/100}%) for retry ${retryCount}`);
+
+                // Get quote and check price impact
+                const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenInMint}&outputMint=${tokenOutMint}&amount=${amountInLamports}&slippageBps=${currentSlippage}&txVersion=V0`;
+
+                let swapResponse;
                 try {
                     const { data: response } = await axios.get(swapQuoteUrl);
-                    // save const { data: response } to swapResponse
-                    swapResponse = response;
                     
-
-                } catch (quoteError: any) {
-                    logger.error('Quote Error Details:', {
-                        message: quoteError.message,
-                        status: quoteError.response?.status,
-                        statusText: quoteError.response?.statusText,
-                        responseData: quoteError.response?.data,
-                        url: swapQuoteUrl
-                    });
-                    throw quoteError;
+                    // If price impact is extreme, throw immediately without retries
+                    if (response.data.priceImpactPct > MAX_ACCEPTABLE_PRICE_IMPACT) {
+                        logger.warn(`🚨 Extreme price impact detected: ${response.data.priceImpactPct}% for ${tokenInMint}`);
+                        logger.warn(`Abandoning token due to unacceptable price impact`);
+                        throw new ExtremePriceImpactError(response.data.priceImpactPct, tokenInMint);
+                    }
+                    
+                    swapResponse = response;
+                } catch (error) {
+                    // Immediately throw ExtremePriceImpactError without retrying
+                    if (error instanceof ExtremePriceImpactError) {
+                        // Remove from pending sells if it exists
+                        this.pendingSells = this.pendingSells.filter(sell => sell.mint !== tokenInMint);
+                        await this.savePendingSells();
+                        throw error;
+                    }
+                    throw error;
                 }
+
+                // Add exponential backoff between retries
+                if (retryCount > 0) {
+                    const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 10000);
+                    logger.info(`Waiting ${backoffTime}ms before retry ${retryCount}`);
+                    await this.delay(backoffTime);
+                }
+
+                logger.info(`Fetching quote from: ${swapQuoteUrl}`);
 
                 // 2. Get recommended priority fees
                 const { data: priorityFeeData } = await axios.get(`${API_URLS.BASE_HOST}${API_URLS.PRIORITY_FEE}`);
                 const computeUnitPrice = String(Math.floor(
                     isSellTransaction 
-                        ? (retryCount > 0 ? priorityFeeData.data.default.h : priorityFeeData.data.default.m)  // Use high priority on retry
+                        ? (retryCount > 0 ? priorityFeeData.data.default.h : priorityFeeData.data.default.h/2)  // Use high priority on retry
                         : priorityFeeData.data.default.m / 5  // Buy: Use 1/5 of medium priority
                 ));
                 logger.info(`Using compute unit price: ${computeUnitPrice} (priority: ${isSellTransaction ? (retryCount > 0 ? 'high' : 'medium') : 'medium/5'}, retry: ${retryCount})`);
@@ -374,8 +404,18 @@ export class SwapService {
                     return txIds;
                 }
 
-            } catch (error) {
+            } catch (error: any) {
                 retryCount++;
+                
+                // Check specifically for slippage error
+                const isSlippageError = error?.response?.data?.message?.includes('slippage') || 
+                                      error?.message?.includes('Custom:40');
+                
+                if (isSlippageError) {
+                    logger.warn(`Slippage error detected on attempt ${retryCount}, will retry with higher slippage`);
+                    continue;
+                }
+
                 const transactionType = isBuyTransaction ? 'Buy' : 'Sell';
                 
                 if (retryCount <= MAX_RETRIES) {
@@ -443,8 +483,9 @@ export class SwapService {
 
             logger.info(`Emergency sell: Attempting to sell entire balance of ${balance} tokens`);
 
-            // Get quote with higher slippage
-            const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=${balance}&slippageBps=${EMERGENCY_SLIPPAGE_BPS}&txVersion=V0`;
+            // Use maximum possible slippage for emergency sells
+            const EMERGENCY_MAX_SLIPPAGE = 4900; // 49% - maximum safe value
+            const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=${balance}&slippageBps=${EMERGENCY_MAX_SLIPPAGE}&txVersion=V0`;
             
             const { data: swapResponse } = await axios.get(swapQuoteUrl);
 

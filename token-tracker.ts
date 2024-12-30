@@ -3,6 +3,7 @@ import { logger } from './helpers';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { SwapService } from './swap-service';
+import { ExtremePriceImpactError } from './swap-service';
 
 interface TokenHolding {
     mint: string;
@@ -185,9 +186,24 @@ export class TokenTracker {
 
     private async handleFullSell(holding: TokenHolding): Promise<void> {
         try {
+            // Check our balance first
+            const ourBalance = await this.getTokenBalance(
+                holding.mint,
+                this.swapService['userWallet'].publicKey
+            );
+
+            // If we have no balance, just remove from holdings and return
+            if (ourBalance <= 0) {
+                logger.info(`No balance found for ${holding.mint}, removing from holdings`);
+                this.holdings = this.holdings.filter(h => h.mint !== holding.mint);
+                await this.saveHoldings();
+                return;
+            }
+
+            // Continue with sell attempt only if we have a balance
             const txId = await this.swapService.executeSwap(
                 holding.mint,
-                'So11111111111111111111111111111111111111112', // SOL
+                'So11111111111111111111111111111111111111112',
                 holding.amount,
                 this.targetWallet,
                 true
@@ -213,6 +229,18 @@ export class TokenTracker {
                 });
             }
         } catch (error) {
+            if (error instanceof ExtremePriceImpactError) {
+                logger.warn(`🚨 Abandoning token ${holding.mint} due to extreme price impact of ${error.priceImpact}%`);
+                
+                // Remove from holdings immediately
+                this.holdings = this.holdings.filter(h => h.mint !== holding.mint);
+                await this.saveHoldings();
+                
+                logger.info(`✅ Token ${holding.mint} removed from tracking - accepting loss`);
+                return;
+            }
+            
+            // Handle other errors as before
             logger.error(`Failed to execute full sell for ${holding.mint}:`, error);
             // Similarly, could add to pending sells here
             logger.info(`Adding ${holding.mint} to pending sells for retry...`);
