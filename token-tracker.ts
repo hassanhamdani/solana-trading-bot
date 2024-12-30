@@ -47,14 +47,21 @@ export class TokenTracker {
     }
 
     public async addHolding(mint: string, amount: number): Promise<void> {
+        // Get mint info to find decimals
+        const mintInfo = await this.connection.getParsedAccountInfo(new PublicKey(mint));
+        const decimals = (mintInfo.value?.data as any)?.parsed?.info?.decimals ?? 9;
+        
+        // Convert the raw amount to decimal-adjusted amount
+        const adjustedAmount = amount / Math.pow(10, decimals);
+        
         this.holdings.push({
             mint,
-            amount,
+            amount: adjustedAmount,
             targetAmount: 0,
             lastChecked: Date.now()
         });
         await this.saveHoldings();
-        logger.info(`Added new holding: ${mint} with amount ${amount}`);
+        logger.info(`Added new holding: ${mint} with amount ${adjustedAmount}`);
     }
 
     private async sleep(ms: number): Promise<void> {
@@ -178,7 +185,7 @@ export class TokenTracker {
 
     private async handleFullSell(holding: TokenHolding): Promise<void> {
         try {
-            await this.swapService.executeSwap(
+            const txId = await this.swapService.executeSwap(
                 holding.mint,
                 'So11111111111111111111111111111111111111112', // SOL
                 holding.amount,
@@ -186,12 +193,37 @@ export class TokenTracker {
                 true
             );
 
-            // Remove the holding after successful sell
-            this.holdings = this.holdings.filter(h => h.mint !== holding.mint);
-            await this.saveHoldings();
-            logger.info(`Successfully sold entire holding of ${holding.mint}`);
+            // Verify transaction success before updating holdings
+            if (txId && await this.swapService.verifyTransactionSuccess(txId)) {
+                // Remove the holding after successful sell verification
+                this.holdings = this.holdings.filter(h => h.mint !== holding.mint);
+                await this.saveHoldings();
+                logger.info(`✅ Successfully verified and removed holding of ${holding.mint}`);
+                logger.info(`Transaction verified: https://solscan.io/tx/${txId}`);
+            } else {
+                logger.error(`❌ Failed to verify transaction for ${holding.mint}`);
+                // Optionally, you could add this to pending sells for retry
+                logger.info(`Adding ${holding.mint} to pending sells for retry...`);
+                await this.swapService['pendingSells'].push({
+                    mint: holding.mint,
+                    amount: holding.amount,
+                    attempts: 1,
+                    lastAttempt: Date.now(),
+                    targetWallet: this.targetWallet
+                });
+            }
         } catch (error) {
             logger.error(`Failed to execute full sell for ${holding.mint}:`, error);
+            // Similarly, could add to pending sells here
+            logger.info(`Adding ${holding.mint} to pending sells for retry...`);
+            await this.swapService['pendingSells'].push({
+                mint: holding.mint,
+                amount: holding.amount,
+                attempts: 1,
+                lastAttempt: Date.now(),
+                targetWallet: this.targetWallet
+            });
+
         }
     }
 

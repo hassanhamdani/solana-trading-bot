@@ -12,7 +12,7 @@ import path from 'path';
 
 dotenv.config(); // Load environment variables
 
-let ENABLE_BUY = true;  // Control buying (SOL -> Token)
+let ENABLE_BUY = false;  // Control buying (SOL -> Token)
 let ENABLE_SELL = true; // Control selling (Token -> SOL)
 
 const MAX_RETRIES = 3;
@@ -140,7 +140,6 @@ export class SwapService {
 
                 if (isSellingTransaction && targetWalletAddress) {
                     // Constants for safety checks
-                    const MIN_SELL_PERCENTAGE = 1; // Don't sell if less than 1%
                     const MAX_SELL_PERCENTAGE = 100; // Cap at 100%
 
                     // Get target wallet's balance
@@ -156,69 +155,41 @@ export class SwapService {
                         { mint: new PublicKey(tokenInMint) }
                     );
 
-                    // Safety checks
-                    if (!tokenAccounts.value.length) {
-                        logger.error('Target wallet has no token account for this token');
-                        return null;
-                    }
-
                     if (!ourTokenAccounts.value.length) {
                         logger.error('Our wallet has no token account for this token');
                         return null;
                     }
 
-                    const targetCurrentBalance = Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
+                    // Handle case where target has no token account (complete sell)
+                    const targetCurrentBalance = tokenAccounts.value.length 
+                        ? Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount)
+                        : 0;
                     const ourCurrentBalance = Number(ourTokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
-
-                    // Validate balances
-                    if (targetCurrentBalance <= 0) {
-                        logger.error('Target wallet has zero balance');
-                        return null;
-                    }
-
-                    if (ourCurrentBalance <= 0) {
-                        logger.error('Our wallet has zero balance');
-                        return null;
-                    }
 
                     // Calculate sell percentage
                     const targetSellAmount = amountIn;
-                    if (targetSellAmount > targetCurrentBalance) {
-                        logger.error('Target sell amount exceeds their balance - possible error in input');
-                        return null;
+                    
+                    // If target has completely sold (no token account), sell everything
+                    if (tokenAccounts.value.length === 0) {
+                        logger.info('Target wallet has no token account - executing full sell');
+                        amountIn = ourCurrentBalance;
+                    } else {
+                        if (targetSellAmount > targetCurrentBalance) {
+                            logger.error('Target sell amount exceeds their balance - possible error in input');
+                            return null;
+                        }
+
+                        let targetSellPercentage = (targetSellAmount / targetCurrentBalance) * 100;
+                        // Calculate our sell amount based on target's percentage
+                        amountIn = Math.floor((ourCurrentBalance * targetSellPercentage) / 100);
                     }
-
-                    let targetSellPercentage = (targetSellAmount / targetCurrentBalance) * 100;
-
-                    // Apply safety thresholds
-                    if (targetSellPercentage < MIN_SELL_PERCENTAGE) {
-                        logger.warn(`Sell percentage (${targetSellPercentage.toFixed(2)}%) below minimum threshold, skipping`);
-                        return null;
-                    }
-
-                    if (targetSellPercentage > MAX_SELL_PERCENTAGE) {
-                        logger.warn(`Sell percentage capped from ${targetSellPercentage.toFixed(2)}% to ${MAX_SELL_PERCENTAGE}%`);
-                        targetSellPercentage = MAX_SELL_PERCENTAGE;
-                    }
-
-                    // Calculate our sell amount
-                    let ourSellAmount = (ourCurrentBalance * targetSellPercentage) / 100;
-
-                    // Round to appropriate decimal places based on token decimals
-                    const tokenDecimals = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.decimals;
-                    ourSellAmount = Math.floor(ourSellAmount); // Ensure we have a whole number of base units
 
                     logger.info({
                         targetCurrentBalance,
                         ourCurrentBalance,
                         targetSellAmount,
-                        targetSellPercentage: targetSellPercentage.toFixed(2) + '%',
-                        ourSellAmount,
-                        tokenDecimals
+                        finalSellAmount: amountIn
                     });
-
-                    // Update amountIn for the actual swap
-                    amountIn = ourSellAmount;
                 }
 
                 logger.info(`Attempting swap via Raydium API:`);
@@ -389,7 +360,19 @@ export class SwapService {
                     }
                 }
 
-                return signatures.join(',');
+                // After successful transaction confirmation, update pending sells
+                if (signatures.length > 0) {
+                    const txIds = signatures.join(',');
+                    logger.info(`$$$$$$$$$ Swap completed successfully ${txIds} $$$$$$$$$`);
+                    
+                    // If it's a sell transaction, log the specific details
+                    if (isSellingTransaction) {
+                        logger.info(`Successfully sold ${amountIn} tokens of ${tokenInMint} for SOL`);
+                        logger.info(`Swap transaction details: https://solscan.io/tx/${txIds}`);
+                    }
+                    
+                    return txIds;
+                }
 
             } catch (error) {
                 retryCount++;
@@ -595,5 +578,15 @@ export class SwapService {
                 await this.savePendingSells();
             }
         }
+    }
+
+    // Add static method to check if buying is enabled
+    static isBuyingEnabled(): boolean {
+        return ENABLE_BUY;
+    }
+
+    // Add static method to check if selling is enabled
+    static isSellingEnabled(): boolean {
+        return ENABLE_SELL;
     }
 } 

@@ -63,6 +63,15 @@ export class CopyTradingBot {
 
     public async handleTrade(tx: TradeDetails) {
         try {
+            // Check if this is a buy transaction (SOL -> Token)
+            const isBuyTransaction = tx.tokenIn.mint === 'So11111111111111111111111111111111111111112';
+            
+            // Early exit without error logging if transaction type is disabled
+            if (isBuyTransaction && !SwapService.isBuyingEnabled()) {
+                logger.info('Buy transactions are currently disabled - skipping trade');
+                return;
+            }
+
             logger.info(`🔄 Copying trade from transaction: ${tx.signature}`);
             logger.info('Trade details:', JSON.stringify({
                 tokenIn: {
@@ -111,8 +120,6 @@ export class CopyTradingBot {
                         logger.error(`❌ Retry failed to execute`);
                     }
                 }
-            } else {
-                logger.error('Failed to execute swap');
             }
 
         } catch (error) {
