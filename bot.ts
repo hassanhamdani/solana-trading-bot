@@ -43,20 +43,18 @@ export class CopyTradingBot {
         const decodedKey = bs58.decode(privateKey);
         this.userWallet = Keypair.fromSecretKey(decodedKey);
         
-        // Pass both wallets to SwapService
+        // Initialize SwapService first
         this.swapService = new SwapService(
             connection, 
             this.userWallet,
-            this.targetWallet  // Add target wallet
+            this.targetWallet
         );
         
+        // Initialize SwapTracker without starting it
         this.swapTracker = new SwapTracker(connection, targetWallet, this);
         
-        // Bind the trade handler to this instance
+        // Bind the trade handler
         this.handleTrade = this.handleTrade.bind(this);
-
-        // Start tracking tokens
-        this.swapService.tokenTracker.startTracking();
     }
 
     private async executeSwap(tokenIn: string, tokenOut: string, amount: number, poolAddress?: string): Promise<string | null> {
@@ -213,9 +211,10 @@ export class CopyTradingBot {
         logger.info(`Target wallet: ${this.targetWallet}`);
         logger.info(`Your wallet: ${this.userWallet.publicKey.toString()}`);
 
-        // Start both trackers concurrently using Promise.all
+        // Start both trackers concurrently
         await Promise.all([
-            this.swapTracker.trackSwaps()
+            this.swapTracker.trackSwaps(),
+            this.swapService.tokenTracker.startTracking()
         ]);
     }
 

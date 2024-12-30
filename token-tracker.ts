@@ -65,14 +65,29 @@ export class TokenTracker {
         this.isTracking = true;
         logger.info('Starting token balance tracking...');
         
-        // Remove the interval and use a continuous loop instead
+        // Add heartbeat interval
+        const heartbeatInterval = setInterval(() => {
+            if (!this.isTracking) {
+                clearInterval(heartbeatInterval);
+                return;
+            }
+            this.logHoldingsComparison();
+        }, this.HEARTBEAT_INTERVAL);
+        
+        // Main tracking loop
         while (this.isTracking) {
             try {
                 await this.checkBalances();
+                // Add a small delay between checks to prevent overwhelming the RPC
+                await this.sleep(this.CHECK_INTERVAL);
             } catch (error) {
                 logger.error('Error in balance tracking:', error);
+                await this.sleep(1000); // Wait a bit longer on error
             }
         }
+
+        // Cleanup on stop
+        clearInterval(heartbeatInterval);
     }
 
     private async getTokenBalance(mint: string, owner: PublicKey): Promise<number> {

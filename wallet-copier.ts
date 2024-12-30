@@ -137,14 +137,14 @@ export class SwapTracker {
                 'confirmed'
             );
 
-            // Separate heartbeat interval
+            // Create heartbeat interval
             const heartbeatInterval = setInterval(() => {
                 if (!this.isTracking) {
                     clearInterval(heartbeatInterval);
                     return;
                 }
                 logger.info('💗 Wallet tracker heartbeat - Still monitoring transactions');
-            }, 30000);
+            }, 30000); // 30 seconds
 
             // Keep reference to cleanup
             this._cleanup = () => {

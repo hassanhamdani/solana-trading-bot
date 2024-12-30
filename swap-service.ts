@@ -12,7 +12,7 @@ import path from 'path';
 
 dotenv.config(); // Load environment variables
 
-let ENABLE_BUY = false;  // Control buying (SOL -> Token)
+let ENABLE_BUY = true;  // Control buying (SOL -> Token)
 let ENABLE_SELL = true; // Control selling (Token -> SOL)
 
 const MAX_RETRIES = 3;
