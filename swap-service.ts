@@ -6,6 +6,9 @@ import bs58 from 'bs58';
 import dotenv from 'dotenv';
 import { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction } from '@solana/spl-token';
 import { fetchAllDigitalAssetByOwner } from '@metaplex-foundation/mpl-token-metadata';
+import { TokenTracker } from './token-tracker';
+import fs from 'fs/promises';
+import path from 'path';
 
 dotenv.config(); // Load environment variables
 
@@ -16,11 +19,29 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000; // 1 second delay between retries
 const EMERGENCY_SLIPPAGE_BPS = 5000; // 50% slippage for emergency sells
 
+interface PendingSell {
+    mint: string;
+    amount: number;
+    attempts: number;
+    lastAttempt: number;
+    targetWallet: string;
+}
+
 export class SwapService {
     private connection: Connection;
     private userWallet: Keypair;
+    private targetWallet: string;
+    public tokenTracker: TokenTracker;
+    private pendingSells: PendingSell[] = [];
+    private readonly PENDING_SELLS_FILE = path.join(__dirname, 'pending-sells.json');
+    private readonly MAX_TOTAL_ATTEMPTS = 10;
+    private readonly RETRY_INTERVALS = [1000, 2000, 5000, 10000, 30000]; // Increasing delays
 
-    constructor(connection: Connection, userWallet?: Keypair | string) {
+    constructor(
+        connection: Connection, 
+        userWallet?: Keypair | string,
+        targetWallet?: string
+    ) {
         this.connection = connection;
         
         // Use environment variable if no wallet is provided
@@ -43,6 +64,19 @@ export class SwapService {
             this.userWallet = privateKey;
             logger.info(`Wallet initialized from provided Keypair: ${this.userWallet.publicKey.toString()}`);
         }
+
+        // Store target wallet
+        this.targetWallet = targetWallet ?? process.env.TARGET_WALLET ?? '';
+        if (!this.targetWallet) {
+            throw new Error('No target wallet provided in constructor or environment variables');
+        }
+
+        // Pass both wallets to TokenTracker
+        this.tokenTracker = new TokenTracker(
+            connection,
+            this.targetWallet,  // Target wallet for tracking
+            this
+        );
     }
 
     private async delay(ms: number): Promise<void> {
@@ -341,6 +375,20 @@ export class SwapService {
                     }
                 }
 
+                // After successful swap, if it's a buy, add to holdings
+                if (signatures.length > 0 && !isSellingTransaction && tokenInMint === 'So11111111111111111111111111111111111111112') {
+                    // Get the amount of tokens we received
+                    const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+                        this.userWallet.publicKey,
+                        { mint: new PublicKey(tokenOutMint) }
+                    );
+                    
+                    if (tokenAccounts.value.length > 0) {
+                        const amount = Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
+                        await this.tokenTracker.addHolding(tokenOutMint, amount);
+                    }
+                }
+
                 return signatures.join(',');
 
             } catch (error) {
@@ -514,6 +562,38 @@ export class SwapService {
         } catch (error) {
             logger.error(`Error verifying transaction ${signature}:`, error);
             return false;
+        }
+    }
+
+    private async loadPendingSells(): Promise<void> {
+        try {
+            const data = await fs.readFile(this.PENDING_SELLS_FILE, 'utf8');
+            this.pendingSells = JSON.parse(data);
+        } catch (error) {
+            this.pendingSells = [];
+        }
+    }
+
+    private async savePendingSells(): Promise<void> {
+        await fs.writeFile(this.PENDING_SELLS_FILE, JSON.stringify(this.pendingSells, null, 2));
+    }
+
+    private async processPendingSells(): Promise<void> {
+        for (const sell of this.pendingSells) {
+            if (Date.now() - sell.lastAttempt > this.RETRY_INTERVALS[Math.min(sell.attempts, this.RETRY_INTERVALS.length - 1)]) {
+                try {
+                    await this.triggerEmergencySell(sell.mint);
+                    this.pendingSells = this.pendingSells.filter(s => s.mint !== sell.mint);
+                } catch (error) {
+                    sell.attempts++;
+                    sell.lastAttempt = Date.now();
+                    if (sell.attempts >= this.MAX_TOTAL_ATTEMPTS) {
+                        logger.error(`Critical: Failed to sell ${sell.mint} after ${sell.attempts} total attempts`);
+                        // Could add notification system here
+                    }
+                }
+                await this.savePendingSells();
+            }
         }
     }
 } 

@@ -31,7 +31,7 @@ export class CopyTradingBot {
     private readonly SOLANA_TRACKER_API = 'https://swap-v2.solanatracker.io/swap';
     private readonly slippagePercentage = Number(process.env.BUY_SLIPPAGE) || 20;
     private readonly computeUnitPrice = Number(process.env.COMPUTE_UNIT_PRICE) || 421197;
-    private swapService: SwapService;
+    public swapService: SwapService;
 
     constructor(
         connection: Connection,
@@ -40,15 +40,23 @@ export class CopyTradingBot {
     ) {
         this.connection = connection;
         this.targetWallet = targetWallet;
-        // Convert base58 private key to Uint8Array
-        const bs58 = require('bs58');
         const decodedKey = bs58.decode(privateKey);
         this.userWallet = Keypair.fromSecretKey(decodedKey);
+        
+        // Pass both wallets to SwapService
+        this.swapService = new SwapService(
+            connection, 
+            this.userWallet,
+            this.targetWallet  // Add target wallet
+        );
+        
         this.swapTracker = new SwapTracker(connection, targetWallet, this);
-        this.swapService = new SwapService(connection, this.userWallet);
         
         // Bind the trade handler to this instance
         this.handleTrade = this.handleTrade.bind(this);
+
+        // Start tracking tokens
+        this.swapService.tokenTracker.startTracking();
     }
 
     private async executeSwap(tokenIn: string, tokenOut: string, amount: number, poolAddress?: string): Promise<string | null> {
@@ -199,21 +207,22 @@ export class CopyTradingBot {
     //     }
     // }
 
-    async start() {
+    public async start() {
         this.isRunning = true;
         logger.info(`🤖 Starting copy trading bot...`);
         logger.info(`Target wallet: ${this.targetWallet}`);
         logger.info(`Your wallet: ${this.userWallet.publicKey.toString()}`);
 
-
-        // Start tracking swaps
-        await this.swapTracker.trackSwaps();
+        // Start both trackers concurrently using Promise.all
+        await Promise.all([
+            this.swapTracker.trackSwaps()
+        ]);
     }
 
-    stop() {
+    public stop(): void {
         this.isRunning = false;
-        // Remove event listener
         this.swapTracker.stop();
+        this.swapService.tokenTracker.stop();
         logger.info(`🛑 Stopping copy trading bot...`);
     }
 }

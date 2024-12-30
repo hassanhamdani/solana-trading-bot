@@ -25,7 +25,7 @@ const checkConnection = async () => {
 };
 
 const runSwapTracker = async () => {
-    await checkConnection(); // Add connection check
+    await checkConnection();
     logger.level = LOG_LEVEL;
     logger.info('Swap tracker is starting...');
 
@@ -34,8 +34,9 @@ const runSwapTracker = async () => {
 
     const privateKey = process.env.PRIVATE_KEY || '';
     const bot = new Bot(connection, walletToTrack, privateKey);
-    const tracker = new SwapTracker(connection, walletToTrack, bot);
-    await tracker.trackSwaps();
+    
+    // Start the bot instead of directly starting the tracker
+    await bot.start();
 
     logger.info('Swap tracker is running! Press CTRL + C to stop it.');
 };

@@ -17,6 +17,7 @@ export class SwapTracker {
     private lastProcessedTime: number = 0;
     private readonly RATE_LIMIT_DELAY = 500;
     private bot: CopyTradingBot;
+    private _cleanup: (() => void) | null = null;
 
     constructor(connection: Connection, walletAddress: string, bot: CopyTradingBot) {
         this.connection = connection;
@@ -68,12 +69,19 @@ export class SwapTracker {
         const tokenSent = walletChanges.find(change => change.change < 0);
 
         if (tokenReceived && tokenSent) {
-            logger.info('\n🔄 Transaction Details:');
+            // Only process if this is a buy (token received is not SOL)
+            const WSOL = 'So11111111111111111111111111111111111111112';
+            if (tokenReceived.mint === WSOL) {
+                logger.info('Skipping SOL receive transaction (likely a sell)');
+                return;
+            }
+
+            logger.info('\n🔄 Buy Transaction Details:');
             logger.info('------------------------');
             logger.info(`Signature: ${signature}`);
             logger.info(`Time: ${timestamp}`);
             
-            logger.info('\n📊 Swap Details:');
+            logger.info('\n📊 Buy Details:');
             logger.info(`📉 Sent: ${Math.abs(tokenSent.change)} (${tokenSent.mint})`);
             logger.info(`📈 Received: ${tokenReceived.change} (${tokenReceived.mint})`);
 
@@ -100,10 +108,9 @@ export class SwapTracker {
     async trackSwaps() {
         this.isTracking = true;
         logger.info(`🎯 Starting to track wallet: ${this.walletAddress}`);
-        let lastHeartbeat = Date.now();
-        const HEARTBEAT_INTERVAL = 30000; // 30 seconds
 
         try {
+            // Start subscription
             const subscriptionId = this.connection.onLogs(
                 new PublicKey(this.walletAddress),
                 async (logs) => {
@@ -130,18 +137,21 @@ export class SwapTracker {
                 'confirmed'
             );
 
-            logger.info('✅ Wallet tracking started successfully');
-
-            while (this.isTracking) {
-                const currentTime = Date.now();
-                if (currentTime - lastHeartbeat >= HEARTBEAT_INTERVAL) {
-                    logger.info('💗 Wallet tracker heartbeat - Still monitoring transactions');
-                    lastHeartbeat = currentTime;
+            // Separate heartbeat interval
+            const heartbeatInterval = setInterval(() => {
+                if (!this.isTracking) {
+                    clearInterval(heartbeatInterval);
+                    return;
                 }
-                await new Promise(resolve => setTimeout(resolve, 500));
-            }
+                logger.info('💗 Wallet tracker heartbeat - Still monitoring transactions');
+            }, 30000);
 
-            this.connection.removeOnLogsListener(subscriptionId);
+            // Keep reference to cleanup
+            this._cleanup = () => {
+                clearInterval(heartbeatInterval);
+                this.connection.removeOnLogsListener(subscriptionId);
+            };
+
         } catch (error) {
             logger.error(`Error in trackSwaps: ${error}`);
             this.isTracking = false;
@@ -150,6 +160,9 @@ export class SwapTracker {
 
     stop() {
         this.isTracking = false;
+        if (this._cleanup) {
+            this._cleanup();
+        }
         logger.info('🛑 Stopping wallet tracking...');
     }
 
