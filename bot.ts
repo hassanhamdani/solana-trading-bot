@@ -42,17 +42,17 @@ export class CopyTradingBot {
         this.targetWallet = targetWallet;
         const decodedKey = bs58.decode(privateKey);
         this.userWallet = Keypair.fromSecretKey(decodedKey);
-        
+
         // Initialize SwapService first
         this.swapService = new SwapService(
-            connection, 
+            connection,
             this.userWallet,
             this.targetWallet
         );
-        
+
         // Initialize SwapTracker without starting it
         this.swapTracker = new SwapTracker(connection, targetWallet, this);
-        
+
         // Bind the trade handler
         this.handleTrade = this.handleTrade.bind(this);
     }
@@ -65,7 +65,7 @@ export class CopyTradingBot {
         try {
             // Check if this is a buy transaction (SOL -> Token)
             const isBuyTransaction = tx.tokenIn.mint === 'So11111111111111111111111111111111111111112';
-            
+
             // Early exit without error logging if transaction type is disabled
             if (isBuyTransaction && !SwapService.isBuyingEnabled()) {
                 logger.info('Buy transactions are currently disabled - skipping trade');
@@ -82,31 +82,31 @@ export class CopyTradingBot {
                     mint: tx.tokenOut.mint
                 }
             }, null, 2));
-            
+
             const signature = await this.swapService.executeSwap(
                 tx.tokenIn.mint,
                 tx.tokenOut.mint,
                 tx.tokenIn.amount
             );
-            
+
             if (signature) {
                 // Verify transaction success
                 const isSuccess = await this.swapService.verifyTransactionSuccess(signature);
-                
+
                 if (isSuccess) {
                     logger.info(`✅ Successfully copied trade!`);
                     logger.info(`Transaction signature: ${signature}`);
                     logger.info(`Solscan: https://solscan.io/tx/${signature}`);
                 } else {
                     logger.warn(`⚠️ Initial transaction failed, attempting retry...`);
-                    
+
                     // Retry the swap
                     const retrySignature = await this.swapService.executeSwap(
                         tx.tokenIn.mint,
                         tx.tokenOut.mint,
                         tx.tokenIn.amount
                     );
-                    
+
                     if (retrySignature) {
                         const retrySuccess = await this.swapService.verifyTransactionSuccess(retrySignature);
                         if (retrySuccess) {
@@ -175,7 +175,7 @@ export class CopyTradingBot {
     // private extractRaydiumAccounts(txData: any): RaydiumV4Accounts | null {
     //     try {
     //         const raydiumV4ProgramId = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
-            
+
     //         // Find the Raydium instruction
     //         const raydiumInstruction = txData.transaction.message.compiledInstructions.find(
     //             (ix: any) => txData.transaction.message.staticAccountKeys[ix.programIdIndex].toString() === raydiumV4ProgramId

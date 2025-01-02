@@ -3,6 +3,10 @@ import { Connection } from '@solana/web3.js';
 import { logger, COMMITMENT_LEVEL, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT, LOG_LEVEL } from './helpers';
 import { SwapTracker } from './wallet-copier';
 import { CopyTradingBot as Bot } from './bot';
+import { connectToDatabase, disconnectFromDatabase } from './db/connection';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const connection = new Connection(RPC_ENDPOINT, {
     wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
@@ -14,18 +18,23 @@ const connection = new Connection(RPC_ENDPOINT, {
 });
 
 // Add connection check
-const checkConnection = async () => {
+const checkConnections = async () => {
     try {
+        // Check Solana RPC connection
         await connection.getLatestBlockhash();
-        logger.info('RPC connection established successfully');
+        logger.info('✅ RPC connection established successfully');
+
+        // Check MongoDB connection
+        await connectToDatabase();
+        logger.info('✅ Database connection established successfully');
     } catch (error) {
-        logger.error('Failed to connect to RPC:', error);
+        logger.error('❌ Connection check failed:', error);
         process.exit(1);
     }
 };
 
 const runSwapTracker = async () => {
-    await checkConnection();
+    await checkConnections();
     logger.level = LOG_LEVEL;
     logger.info('Swap tracker is starting...');
 
@@ -34,11 +43,22 @@ const runSwapTracker = async () => {
 
     const privateKey = process.env.PRIVATE_KEY || '';
     const bot = new Bot(connection, walletToTrack, privateKey);
-    
-    // Start the bot instead of directly starting the tracker
-    await bot.start();
 
+    await bot.start();
     logger.info('Swap tracker is running! Press CTRL + C to stop it.');
 };
+
+// Handle graceful shutdown
+process.on('SIGINT', async () => {
+    logger.info('Received SIGINT. Cleaning up...');
+    await disconnectFromDatabase();
+    process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+    logger.info('Received SIGTERM. Cleaning up...');
+    await disconnectFromDatabase();
+    process.exit(0);
+});
 
 runSwapTracker();
