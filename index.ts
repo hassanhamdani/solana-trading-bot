@@ -24,6 +24,9 @@ const checkConnection = async () => {
     }
 };
 
+// Add this constant at the top with other constants
+const MIN_SOL_BALANCE = 0.5;
+
 const runSwapTracker = async () => {
     await checkConnection();
     logger.level = LOG_LEVEL;
@@ -35,9 +38,24 @@ const runSwapTracker = async () => {
     const privateKey = process.env.PRIVATE_KEY || '';
     const bot = new Bot(connection, walletToTrack, privateKey);
     
-    // Start the bot instead of directly starting the tracker
-    await bot.start();
+    // Add balance check interval
+    const balanceCheckInterval = setInterval(async () => {
+        try {
+            const balance = await connection.getBalance(bot.userWallet.publicKey);
+            const solBalance = balance / 1e9; // Convert lamports to SOL
+            
+            if (solBalance < MIN_SOL_BALANCE) {
+                logger.warn(`SOL balance (${solBalance}) below minimum threshold of ${MIN_SOL_BALANCE}. Stopping bot...`);
+                clearInterval(balanceCheckInterval);
+                await bot.stop();
+                process.exit(0);
+            }
+        } catch (error) {
+            logger.error('Error checking balance:', error);
+        }
+    }, 30000); // Check every 30 seconds
 
+    await bot.start();
     logger.info('Swap tracker is running! Press CTRL + C to stop it.');
 };
 

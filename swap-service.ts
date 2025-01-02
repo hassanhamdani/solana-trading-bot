@@ -18,10 +18,11 @@ let ENABLE_SELL = true; // Control selling (Token -> SOL)
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000; // 1 second delay between retries
 const EMERGENCY_SLIPPAGE_BPS = 5000; // 50% slippage for emergency sells
-const BASE_SLIPPAGE_BPS = 3000; // 25% base slippage
+const BASE_SLIPPAGE_BPS = 2300; // 25% base slippage
 const MAX_SLIPPAGE_BPS = 4900;  // 49% max slippage
 const SLIPPAGE_INCREMENT = 500; // 5% increment per retry
 const MAX_ACCEPTABLE_PRICE_IMPACT = 100; // 100%
+const MIN_SOL_OUTPUT = 0.000001; // Minimum SOL output threshold
 
 interface PendingSell {
     mint: string;
@@ -29,13 +30,6 @@ interface PendingSell {
     attempts: number;
     lastAttempt: number;
     targetWallet: string;
-}
-
-export class ExtremePriceImpactError extends Error {
-    constructor(public priceImpact: number, public mint: string) {
-        super(`Extreme price impact of ${priceImpact}% detected for ${mint}`);
-        this.name = 'ExtremePriceImpactError';
-    }
 }
 
 export class SwapService {
@@ -112,6 +106,8 @@ export class SwapService {
 
         // Only log swap type if the transaction type is enabled
         logger.info(`Swap Type: ${isBuyTransaction ? 'BUY' : 'SELL'}`);
+
+        const transactionType = tokenInMint === 'So11111111111111111111111111111111111111112' ? 'BUY' : 'SELL';
 
         while (retryCount <= MAX_RETRIES) {
             try {
@@ -229,26 +225,47 @@ export class SwapService {
                 // Get quote and check price impact
                 const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenInMint}&outputMint=${tokenOutMint}&amount=${amountInLamports}&slippageBps=${currentSlippage}&txVersion=V0`;
 
+                logger.info(`Getting quote from: ${swapQuoteUrl}`);
+
                 let swapResponse;
                 try {
                     const { data: response } = await axios.get(swapQuoteUrl);
                     
-                    // If price impact is extreme, throw immediately without retries
-                    if (response.data.priceImpactPct > MAX_ACCEPTABLE_PRICE_IMPACT) {
-                        logger.warn(`🚨 Extreme price impact detected: ${response.data.priceImpactPct}% for ${tokenInMint}`);
-                        logger.warn(`Abandoning token due to unacceptable price impact`);
-                        throw new ExtremePriceImpactError(response.data.priceImpactPct, tokenInMint);
+                    // For sell transactions, log details
+                    if (isSellingTransaction) {
+                        const outAmount = Number(response.data.outputAmount) || 0;
+                        const solOutput = outAmount / 1e9; // Convert lamports to SOL
+                        
+                        logger.info(`🔍 Quote Details:`);
+                        logger.info(`- Input Token: ${tokenInMint}`);
+                        logger.info(`- Amount In: ${amountInLamports} lamports`);
+                        logger.info(`- Expected SOL Output: ${solOutput} SOL`);
+                        
+                        if (solOutput < MIN_SOL_OUTPUT) {
+                            logger.warn(`🚨 Insufficient SOL output: ${solOutput} SOL for ${tokenInMint}`);
+                            logger.warn(`Abandoning token due to low value`);
+                            throw new Error(`Insufficient SOL output: ${solOutput} SOL`);
+                        }
                     }
                     
                     swapResponse = response;
                 } catch (error) {
-                    // Immediately throw ExtremePriceImpactError without retrying
-                    if (error instanceof ExtremePriceImpactError) {
+                    // Handle case where price impact check fails
+                    if ((error as any).message?.includes('priceImpactPct') || 
+                        ((error as any).response?.data === undefined && isSellingTransaction)) {
+                        logger.info(`Unable to get price impact for ${tokenInMint} - treating as already sold`);
+                        // Remove from holdings if it exists
+                        if (this.tokenTracker) {
+                            this.tokenTracker.holdings = this.tokenTracker.holdings.filter(h => h.mint !== tokenInMint);
+                            await this.tokenTracker.saveHoldings();
+                        }
                         // Remove from pending sells if it exists
                         this.pendingSells = this.pendingSells.filter(sell => sell.mint !== tokenInMint);
                         await this.savePendingSells();
-                        throw error;
+                        return null;
                     }
+                    
+                    // Handle other types of errors
                     throw error;
                 }
 
@@ -404,19 +421,9 @@ export class SwapService {
                     return txIds;
                 }
 
-            } catch (error: any) {
-                retryCount++;
-                
-                // Check specifically for slippage error
-                const isSlippageError = error?.response?.data?.message?.includes('slippage') || 
-                                      error?.message?.includes('Custom:40');
-                
-                if (isSlippageError) {
-                    logger.warn(`Slippage error detected on attempt ${retryCount}, will retry with higher slippage`);
-                    continue;
-                }
+            } catch (error) {
 
-                const transactionType = isBuyTransaction ? 'Buy' : 'Sell';
+                retryCount++;
                 
                 if (retryCount <= MAX_RETRIES) {
                     logger.warn(`${transactionType} transaction failed, attempt ${retryCount}/${MAX_RETRIES}. Error:`, error);
@@ -426,15 +433,7 @@ export class SwapService {
                 
                 logger.error(`${transactionType} transaction failed after ${MAX_RETRIES} attempts:`, error);
                 
-                // Trigger emergency sell if this was a failed sell transaction
-                if (isSellTransaction) {
-                    logger.warn('Initiating emergency sell protocol...');
-                    this.triggerEmergencySell(tokenInMint).catch(emergencyError => {
-                        logger.error('Emergency sell also failed:', emergencyError);
-                    });
-                }
-                
-                return null;
+                throw error;
             }
         }
         

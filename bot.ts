@@ -24,7 +24,7 @@ export interface TradeDetails {
 export class CopyTradingBot {
     private connection: Connection;
     private targetWallet: string;
-    private userWallet: Keypair;
+    public userWallet: Keypair;
     private swapTracker: SwapTracker;
     private isRunning: boolean = false;
     private readonly WSOL_MINT = 'So11111111111111111111111111111111111111112';

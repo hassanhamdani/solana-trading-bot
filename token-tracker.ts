@@ -3,7 +3,6 @@ import { logger } from './helpers';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { SwapService } from './swap-service';
-import { ExtremePriceImpactError } from './swap-service';
 
 interface TokenHolding {
     mint: string;
@@ -16,7 +15,7 @@ export class TokenTracker {
     private connection: Connection;
     private targetWallet: string;
     private swapService: SwapService;
-    private holdings: TokenHolding[] = [];
+    public holdings: TokenHolding[] = [];
     private isTracking: boolean = false;
     private readonly HOLDINGS_FILE = path.join(__dirname, 'holdings.json');
     private readonly CHECK_INTERVAL = 5000; // Check every 5 seconds instead of 1
@@ -43,7 +42,7 @@ export class TokenTracker {
         }
     }
 
-    private async saveHoldings(): Promise<void> {
+    public async saveHoldings(): Promise<void> {
         await fs.writeFile(this.HOLDINGS_FILE, JSON.stringify(this.holdings, null, 2));
     }
 
@@ -200,7 +199,6 @@ export class TokenTracker {
                 return;
             }
 
-            // Continue with sell attempt only if we have a balance
             const txId = await this.swapService.executeSwap(
                 holding.mint,
                 'So11111111111111111111111111111111111111112',
@@ -209,49 +207,14 @@ export class TokenTracker {
                 true
             );
 
-            // Verify transaction success before updating holdings
             if (txId && await this.swapService.verifyTransactionSuccess(txId)) {
-                // Remove the holding after successful sell verification
                 this.holdings = this.holdings.filter(h => h.mint !== holding.mint);
                 await this.saveHoldings();
                 logger.info(`✅ Successfully verified and removed holding of ${holding.mint}`);
                 logger.info(`Transaction verified: https://solscan.io/tx/${txId}`);
-            } else {
-                logger.error(`❌ Failed to verify transaction for ${holding.mint}`);
-                // Optionally, you could add this to pending sells for retry
-                logger.info(`Adding ${holding.mint} to pending sells for retry...`);
-                await this.swapService['pendingSells'].push({
-                    mint: holding.mint,
-                    amount: holding.amount,
-                    attempts: 1,
-                    lastAttempt: Date.now(),
-                    targetWallet: this.targetWallet
-                });
             }
         } catch (error) {
-            if (error instanceof ExtremePriceImpactError) {
-                logger.warn(`🚨 Abandoning token ${holding.mint} due to extreme price impact of ${error.priceImpact}%`);
-                
-                // Remove from holdings immediately
-                this.holdings = this.holdings.filter(h => h.mint !== holding.mint);
-                await this.saveHoldings();
-                
-                logger.info(`✅ Token ${holding.mint} removed from tracking - accepting loss`);
-                return;
-            }
-            
-            // Handle other errors as before
             logger.error(`Failed to execute full sell for ${holding.mint}:`, error);
-            // Similarly, could add to pending sells here
-            logger.info(`Adding ${holding.mint} to pending sells for retry...`);
-            await this.swapService['pendingSells'].push({
-                mint: holding.mint,
-                amount: holding.amount,
-                attempts: 1,
-                lastAttempt: Date.now(),
-                targetWallet: this.targetWallet
-            });
-
         }
     }
 
