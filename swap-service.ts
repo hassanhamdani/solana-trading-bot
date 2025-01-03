@@ -4,7 +4,7 @@ import axios from 'axios';
 import { API_URLS } from '@raydium-io/raydium-sdk-v2';
 import bs58 from 'bs58';
 import dotenv from 'dotenv';
-import { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction } from '@solana/spl-token';
+import { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, getMint } from '@solana/spl-token';
 import { fetchAllDigitalAssetByOwner } from '@metaplex-foundation/mpl-token-metadata';
 import { TokenTracker } from './token-tracker';
 import fs from 'fs/promises';
@@ -95,349 +95,155 @@ export class SwapService {
         targetWalletAddress?: string,
         isSellingTransaction?: boolean
     ): Promise<string | null> {
-        let retryCount = 0;
+        // Early validation for buy/sell controls
         const isBuyTransaction = tokenInMint === 'So11111111111111111111111111111111111111112';
         const isSellTransaction = tokenOutMint === 'So11111111111111111111111111111111111111112';
 
-        // Early exit without logging if transaction type is disabled
         if ((isBuyTransaction && !ENABLE_BUY) || (isSellTransaction && !ENABLE_SELL)) {
+            logger.info(`Transaction skipped: ${isBuyTransaction ? 'BUY' : 'SELL'} transactions are disabled`);
             return null;
         }
 
-        // Only log swap type if the transaction type is enabled
-        logger.info(`Swap Type: ${isBuyTransaction ? 'BUY' : 'SELL'}`);
+        // For buys, always use 0.001 SOL (fixed amount)
+        if (isBuyTransaction) {
+            amountIn = 0.001; // 0.001 SOL
+        }
 
-        const transactionType = tokenInMint === 'So11111111111111111111111111111111111111112' ? 'BUY' : 'SELL';
-
-        while (retryCount <= MAX_RETRIES) {
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
             try {
-                // Add buy/sell control check at the start
-                const isBuyTransaction = tokenInMint === 'So11111111111111111111111111111111111111112';
-                const isSellTransaction = tokenOutMint === 'So11111111111111111111111111111111111111112';
-
-                // Add swap type logging
-                logger.info(`Swap Type: ${isBuyTransaction ? 'BUY' : 'SELL'}`);
-
-                // Early exit if transaction type is disabled
-                if ((isBuyTransaction && !ENABLE_BUY) || (isSellTransaction && !ENABLE_SELL)) {
-                    logger.info(`Transaction skipped: ${isBuyTransaction ? 'BUY' : 'SELL'} transactions are disabled`);
-                    return null;
-                }
-
-                // Check if we own the token before attempting to sell
-                if (isSellingTransaction) {
-                    const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
-                        this.userWallet.publicKey,
-                        { mint: new PublicKey(tokenInMint) }
-                    );
-
-                    if (!tokenAccounts.value.length) {
-                        logger.error(`Cannot execute sell: We don't own token ${tokenInMint}`);
-                        return null;  // Return here without adding to pending sells
+                // Get decimals based on input token
+                let decimals: number;
+                if (isBuyTransaction) {
+                    decimals = 9; // SOL decimals
+                } else {
+                    // Find decimals from holdings for sell transactions
+                    const holding = this.tokenTracker.holdings.find(h => h.mint === tokenInMint);
+                    if (!holding) {
+                        throw new Error(`No holding found for token ${tokenInMint}`);
                     }
-
-                    const ourBalance = Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
-                    if (ourBalance <= 0) {
-                        logger.error(`Cannot execute sell: Zero balance for token ${tokenInMint}`);
-                        return null;  // Return here without adding to pending sells
-                    }
-
-                    logger.info(`Found token ${tokenInMint} in our wallet with balance: ${ourBalance}`);
+                    decimals = holding.decimals;
                 }
 
-                if (isSellingTransaction && targetWalletAddress) {
-                    // Constants for safety checks
-                    const MAX_SELL_PERCENTAGE = 100; // Cap at 100%
+                // Calculate amount with proper decimals
+                const adjustedAmountIn = amountIn * Math.pow(10, decimals);
 
-                    // Get target wallet's balance
-                    const targetWalletPubkey = new PublicKey(targetWalletAddress);
-                    const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
-                        targetWalletPubkey,
-                        { mint: new PublicKey(tokenInMint) }
-                    );
-
-                    // Get our wallet's balance
-                    const ourTokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
-                        this.userWallet.publicKey,
-                        { mint: new PublicKey(tokenInMint) }
-                    );
-
-                    if (!ourTokenAccounts.value.length) {
-                        logger.error('Our wallet has no token account for this token');
-                        return null;
-                    }
-
-                    // Handle case where target has no token account (complete sell)
-                    const targetCurrentBalance = tokenAccounts.value.length 
-                        ? Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount)
-                        : 0;
-                    const ourCurrentBalance = Number(ourTokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
-
-                    // Calculate sell percentage
-                    const targetSellAmount = amountIn;
-                    
-                    // If target has completely sold (no token account), sell everything
-                    if (tokenAccounts.value.length === 0) {
-                        logger.info('Target wallet has no token account - executing full sell');
-                        amountIn = ourCurrentBalance;
-                    } else {
-                        if (targetSellAmount > targetCurrentBalance) {
-                            logger.error('Target sell amount exceeds their balance - possible error in input');
-                            return null;
-                        }
-
-                        let targetSellPercentage = (targetSellAmount / targetCurrentBalance) * 100;
-                        // Calculate our sell amount based on target's percentage
-                        amountIn = Math.floor((ourCurrentBalance * targetSellPercentage) / 100);
-                    }
-
-                    logger.info({
-                        targetCurrentBalance,
-                        ourCurrentBalance,
-                        targetSellAmount,
-                        finalSellAmount: amountIn
-                    });
-                }
-
-                logger.info(`Attempting swap via Raydium API:`);
-                logger.info(`Token In: ${tokenInMint}`);
-                logger.info(`Token Out: ${tokenOutMint}`);
-                
-                // If buying token with SOL, set minimum amount to 0.01 SOL
-                const minimumSolAmount = 0.001;
-                if (tokenInMint === 'So11111111111111111111111111111111111111112') {
-                    amountIn = minimumSolAmount;
-                    logger.info(`Setting minimum SOL amount to: ${minimumSolAmount} SOL`);
-                }
-                
-                // Convert SOL to lamports (1 SOL = 1e9 lamports)
-                const amountInLamports = Math.floor(amountIn * 1e9);
-                logger.info(`Amount In (SOL): ${amountIn}`);
-                logger.info(`Amount In (lamports): ${amountInLamports}`);
-
-                // Calculate dynamic slippage based on retry count and whether it's a sell
-                const currentSlippage = isSellingTransaction 
-                    ? Math.min(BASE_SLIPPAGE_BPS + (retryCount * SLIPPAGE_INCREMENT), MAX_SLIPPAGE_BPS)
-                    : BASE_SLIPPAGE_BPS;
-
-                logger.info(`Using slippage: ${currentSlippage} bps (${currentSlippage/100}%) for retry ${retryCount}`);
-
-                // Get quote and check price impact
-                const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenInMint}&outputMint=${tokenOutMint}&amount=${amountInLamports}&slippageBps=${currentSlippage}&txVersion=V0`;
-
-                logger.info(`Getting quote from: ${swapQuoteUrl}`);
-
-                let swapResponse;
-                try {
-                    const { data: response } = await axios.get(swapQuoteUrl);
-                    
-                    // For sell transactions, log details
-                    if (isSellingTransaction) {
-                        const outAmount = Number(response.data.outputAmount) || 0;
-                        const solOutput = outAmount / 1e9; // Convert lamports to SOL
-                        
-                        logger.info(`🔍 Quote Details:`);
-                        logger.info(`- Input Token: ${tokenInMint}`);
-                        logger.info(`- Amount In: ${amountInLamports} lamports`);
-                        logger.info(`- Expected SOL Output: ${solOutput} SOL`);
-                        
-                        if (solOutput < MIN_SOL_OUTPUT) {
-                            logger.warn(`🚨 Insufficient SOL output: ${solOutput} SOL for ${tokenInMint}`);
-                            logger.warn(`Abandoning token due to low value`);
-                            throw new Error(`Insufficient SOL output: ${solOutput} SOL`);
-                        }
-                    }
-                    
-                    swapResponse = response;
-                } catch (error) {
-                    // Handle case where price impact check fails
-                    if ((error as any).message?.includes('priceImpactPct') || 
-                        ((error as any).response?.data === undefined && isSellingTransaction)) {
-                        logger.info(`Unable to get price impact for ${tokenInMint} - treating as already sold`);
-                        // Remove from holdings if it exists
-                        if (this.tokenTracker) {
-                            this.tokenTracker.holdings = this.tokenTracker.holdings.filter(h => h.mint !== tokenInMint);
-                            await this.tokenTracker.saveHoldings();
-                        }
-                        // Remove from pending sells if it exists
-                        this.pendingSells = this.pendingSells.filter(sell => sell.mint !== tokenInMint);
-                        await this.savePendingSells();
-                        return null;
-                    }
-                    
-                    // Handle other types of errors
-                    throw error;
-                }
-
-                // Add exponential backoff between retries
-                if (retryCount > 0) {
-                    const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 10000);
-                    logger.info(`Waiting ${backoffTime}ms before retry ${retryCount}`);
-                    await this.delay(backoffTime);
-                }
-
-                logger.info(`Fetching quote from: ${swapQuoteUrl}`);
-
-                // 2. Get recommended priority fees
-                const { data: priorityFeeData } = await axios.get(`${API_URLS.BASE_HOST}${API_URLS.PRIORITY_FEE}`);
-                const computeUnitPrice = String(Math.floor(
-                    isSellTransaction 
-                        ? (retryCount > 0 ? priorityFeeData.data.default.h : priorityFeeData.data.default.h/2)  // Use high priority on retry
-                        : priorityFeeData.data.default.m / 5  // Buy: Use 1/5 of medium priority
-                ));
-                logger.info(`Using compute unit price: ${computeUnitPrice} (priority: ${isSellTransaction ? (retryCount > 0 ? 'high' : 'medium') : 'medium/5'}, retry: ${retryCount})`);
-
-                // 3. Build transaction via POST
-                const buildTxUrl = `${API_URLS.SWAP_HOST}/transaction/swap-base-in`;
-                const isInputSol = tokenInMint === 'So11111111111111111111111111111111111111112';
-                const isOutputSol = tokenOutMint === 'So11111111111111111111111111111111111111112';
-
-                // Add validation for token accounts
-                let inputTokenAcc, outputTokenAcc;
-                if (!isInputSol) {
-                    inputTokenAcc = await this.getOrCreateAssociatedTokenAccount(tokenInMint);
-                }
-                if (!isOutputSol) {
-                    outputTokenAcc = await this.getOrCreateAssociatedTokenAccount(tokenOutMint);
-                }
-
-                const { data: swapTransactions } = await axios.post<{
-                    id: string;
-                    version: string;
-                    success: boolean;
-                    data: { transaction: string }[];
-                }>(`${API_URLS.SWAP_HOST}/transaction/swap-base-in`, {
-                    computeUnitPriceMicroLamports: computeUnitPrice,
-                    swapResponse,
-                    txVersion: 'V0',
-                    wallet: this.userWallet.publicKey.toBase58(),
-                    wrapSol: isInputSol,
-                    unwrapSol: isOutputSol,
-                    inputAccount: isInputSol ? undefined : inputTokenAcc?.toBase58(),
-                    outputAccount: isOutputSol ? undefined : outputTokenAcc?.toBase58(),
-                });
-
-                // Add detailed logging of the response
-                logger.info('Build transaction response:', JSON.stringify(swapTransactions, null, 2));
-
-                if (!swapTransactions.success || !swapTransactions.data) {
-                    throw new Error('Failed to build swap transaction');
-                }
-
-                // 4. Process transactions with better error handling and logging
-                const allTxBuf = swapTransactions.data.map(tx => 
-                    Buffer.from(tx.transaction, 'base64')
+                // Calculate dynamic slippage based on retry attempt
+                const currentSlippage = Math.min(
+                    BASE_SLIPPAGE_BPS + (attempt * SLIPPAGE_INCREMENT),
+                    MAX_SLIPPAGE_BPS
                 );
 
-                logger.info(`Transaction version from Raydium: ${swapTransactions.version}`);
-                const signatures: string[] = [];
+                // Get priority fee based on attempt number
+                const { data: priorityFeeData } = await axios.get(`${API_URLS.BASE_HOST}${API_URLS.PRIORITY_FEE}`);
+                const computeUnitPrice = String(Math.floor(
+                    attempt === 0 ? priorityFeeData.data.default.m : priorityFeeData.data.default.h
+                ));
 
-                // Helper function to safely parse transactions
-                const parseTx = (buf: Buffer) => {
-                    try {
-                        return VersionedTransaction.deserialize(buf);
-                    } catch (e) {
-                        logger.warn('Failed to parse as VersionedTransaction, falling back to Legacy Transaction');
-                        return Transaction.from(buf);
-                    }
-                };
+                logger.info(`Attempt ${attempt + 1}/${MAX_RETRIES}:`);
+                logger.info(`- Amount In: ${amountIn} (${adjustedAmountIn} raw)`);
+                logger.info(`- Decimals: ${decimals}`);
+                logger.info(`- Slippage: ${currentSlippage/100}%`);
+                logger.info(`- Priority: ${attempt === 0 ? 'medium' : 'high'}`);
 
-                // Parse and process each transaction
-                const allTransactions = allTxBuf.map(buf => parseTx(buf));
+                // Get quote
+                const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenInMint}&outputMint=${tokenOutMint}&amount=${adjustedAmountIn}&slippageBps=${currentSlippage}&txVersion=V0`;
+                logger.info(`Fetching swap quote from: ${swapQuoteUrl}`);
+                const { data: swapResponse } = await axios.get(swapQuoteUrl);
+                // Convert lamports to SOL (1 SOL = 1e9 lamports)
+                const expectedSolOutput = Number(swapResponse.data.outputAmount) / 1e9;
+                logger.info(`Swap Details:
+                - Price Impact: ${swapResponse.data.priceImpactPct}%
+                - Expected Output: ${expectedSolOutput} SOL`);
 
-                let idx = 0;
-                for (const tx of allTransactions) {
-                    idx++;
-                    logger.info(`Processing transaction ${idx}/${allTransactions.length}`);
+                // Build and execute transaction
+                const txId = await this.buildAndExecuteSwap(
+                    swapResponse,
+                    computeUnitPrice,
+                    tokenInMint,
+                    tokenOutMint
+                );
 
-                    try {
-                        if (tx instanceof VersionedTransaction) {
-                            tx.sign([this.userWallet]);
-                            
-                            const txId = await this.connection.sendTransaction(tx, {
-                                skipPreflight: true,
-                                maxRetries: 3
-                            });
-                            signatures.push(txId);
-
-                            const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash({
-                                commitment: 'finalized'
-                            });
-
-                            logger.info(`Versioned transaction ${idx} sending..., txId: ${txId}`);
-                            await this.connection.confirmTransaction(
-                                {
-                                    blockhash,
-                                    lastValidBlockHeight,
-                                    signature: txId,
-                                },
-                                'confirmed'
-                            );
-                            logger.info(`Versioned transaction ${idx} confirmed`);
-                        } else {
-                            const txId = await sendAndConfirmTransaction(
-                                this.connection,
-                                tx as Transaction,
-                                [this.userWallet],
-                                {
-                                    skipPreflight: true,
-                                    maxRetries: 3
-                                }
-                            );
-                            signatures.push(txId);
-                            logger.info(`Legacy transaction ${idx} confirmed, txId: ${txId}`);
-                        }
-                    } catch (txError) {
-                        logger.error(`Error processing transaction ${idx}:`, txError);
-                        throw txError;
-                    }
-                }
-
-                // After successful swap, if it's a buy, add to holdings
-                if (signatures.length > 0 && !isSellingTransaction && tokenInMint === 'So11111111111111111111111111111111111111112') {
-                    // Get the amount of tokens we received
-                    const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
-                        this.userWallet.publicKey,
-                        { mint: new PublicKey(tokenOutMint) }
-                    );
-                    
-                    if (tokenAccounts.value.length > 0) {
-                        const amount = Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
-                        await this.tokenTracker.addHolding(tokenOutMint, amount);
-                    }
-                }
-
-                // After successful transaction confirmation, update pending sells
-                if (signatures.length > 0) {
-                    const txIds = signatures.join(',');
-                    logger.info(`$$$$$$$$$ Swap completed successfully ${txIds} $$$$$$$$$`);
-                    
-                    // If it's a sell transaction, log the specific details
-                    if (isSellingTransaction) {
-                        logger.info(`Successfully sold ${amountIn} tokens of ${tokenInMint} for SOL`);
-                        logger.info(`Swap transaction details: https://solscan.io/tx/${txIds}`);
-                    }
-                    
-                    return txIds;
+                if (txId) {
+                    logger.info(`Swap successful! Transaction: ${txId}`);
+                    return txId;
                 }
 
             } catch (error) {
+                const isLastAttempt = attempt === MAX_RETRIES - 1;
+                logger.error(`Attempt ${attempt + 1} failed${isLastAttempt ? ' (final attempt)' : ''}:`, error);
 
-                retryCount++;
-                
-                if (retryCount <= MAX_RETRIES) {
-                    logger.warn(`${transactionType} transaction failed, attempt ${retryCount}/${MAX_RETRIES}. Error:`, error);
-                    await this.delay(RETRY_DELAY);
-                    continue;
+                if (!isLastAttempt) {
+                    const backoffTime = 1000 * Math.pow(2, attempt);  // Exponential backoff
+                    logger.info(`Waiting ${backoffTime}ms before next attempt...`);
+                    await this.delay(backoffTime);
                 }
-                
-                logger.error(`${transactionType} transaction failed after ${MAX_RETRIES} attempts:`, error);
-                
-                throw error;
             }
         }
-        
+
         return null;
+    }
+
+    // Helper method to build and execute the swap
+    private async buildAndExecuteSwap(
+        swapResponse: any,
+        computeUnitPrice: string,
+        tokenInMint: string,
+        tokenOutMint: string
+    ): Promise<string | null> {
+        const isInputSol = tokenInMint === 'So11111111111111111111111111111111111111112';
+        const isOutputSol = tokenOutMint === 'So11111111111111111111111111111111111111112';
+
+        // Get or create token accounts
+        let inputTokenAcc, outputTokenAcc;
+        if (!isInputSol) {
+            inputTokenAcc = await this.getOrCreateAssociatedTokenAccount(tokenInMint);
+        }
+        if (!isOutputSol) {
+            outputTokenAcc = await this.getOrCreateAssociatedTokenAccount(tokenOutMint);
+        }
+
+        // Build transaction
+        const { data: swapTransactions } = await axios.post(`${API_URLS.SWAP_HOST}/transaction/swap-base-in`, {
+            computeUnitPriceMicroLamports: computeUnitPrice,
+            swapResponse,
+            txVersion: 'V0',
+            wallet: this.userWallet.publicKey.toBase58(),
+            wrapSol: isInputSol,
+            unwrapSol: isOutputSol,
+            inputAccount: isInputSol ? undefined : inputTokenAcc?.toBase58(),
+            outputAccount: isOutputSol ? undefined : outputTokenAcc?.toBase58(),
+        });
+
+        if (!swapTransactions.success || !swapTransactions.data) {
+            throw new Error('Failed to build swap transaction');
+        }
+
+        // Execute transaction
+        const txBuf = Buffer.from(swapTransactions.data[0].transaction, 'base64');
+        const transaction = VersionedTransaction.deserialize(txBuf);
+        transaction.sign([this.userWallet]);
+
+        const signature = await this.connection.sendTransaction(transaction, {
+            skipPreflight: true,
+            maxRetries: 2
+        });
+
+        // Wait for finalization
+        await this.connection.confirmTransaction(
+            {
+                signature,
+                ...(await this.connection.getLatestBlockhash('finalized'))
+            },
+            'finalized'
+        );
+
+        // After successful swap, store token info if it's a buy
+        if (tokenOutMint !== 'So11111111111111111111111111111111111111112') {
+            const mintInfo = await getMint(this.connection, new PublicKey(tokenOutMint));
+            await this.tokenTracker.addHolding(tokenOutMint, swapResponse.data.outputAmount, mintInfo.decimals);
+        }
+
+        return signature;
     }
 
     private async getOrCreateAssociatedTokenAccount(mint: string): Promise<PublicKey> {
@@ -461,83 +267,6 @@ export class SwapService {
         }
     }
 
-    private async triggerEmergencySell(tokenMint: string): Promise<void> {
-        try {
-            // Get the entire balance of the token
-            const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
-                this.userWallet.publicKey,
-                { mint: new PublicKey(tokenMint) }
-            );
-
-            if (!tokenAccounts.value.length) {
-                logger.error('Emergency sell: No token account found');
-                return;
-            }
-
-            const balance = Number(tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount);
-            if (balance <= 0) {
-                logger.error('Emergency sell: Zero balance');
-                return;
-            }
-
-            logger.info(`Emergency sell: Attempting to sell entire balance of ${balance} tokens`);
-
-            // Use maximum possible slippage for emergency sells
-            const EMERGENCY_MAX_SLIPPAGE = 4900; // 49% - maximum safe value
-            const swapQuoteUrl = `${API_URLS.SWAP_HOST}/compute/swap-base-in?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=${balance}&slippageBps=${EMERGENCY_MAX_SLIPPAGE}&txVersion=V0`;
-            
-            const { data: swapResponse } = await axios.get(swapQuoteUrl);
-
-            // Get max priority fees
-            const { data: priorityFeeData } = await axios.get(`${API_URLS.BASE_HOST}${API_URLS.PRIORITY_FEE}`);
-            const computeUnitPrice = String(Math.floor(priorityFeeData.data.default.h)); // Double the high priority fee
-
-            // Build and execute emergency transaction
-            const buildTxUrl = `${API_URLS.SWAP_HOST}/transaction/swap-base-in`;
-            const { data: swapTransactions } = await axios.post(buildTxUrl, {
-                computeUnitPriceMicroLamports: computeUnitPrice,
-                swapResponse,
-                txVersion: 'V0',
-                wallet: this.userWallet.publicKey.toBase58(),
-                wrapSol: false,
-                unwrapSol: true,
-                inputAccount: (await this.getOrCreateAssociatedTokenAccount(tokenMint)).toBase58(),
-            });
-
-            if (!swapTransactions.success || !swapTransactions.data) {
-                throw new Error('Failed to build emergency swap transaction');
-            }
-
-            // Execute the emergency transaction
-            for (const tx of swapTransactions.data) {
-                const txBuf = Buffer.from(tx.transaction, 'base64');
-                const transaction = VersionedTransaction.deserialize(txBuf);
-                transaction.sign([this.userWallet]);
-                
-                const txId = await this.connection.sendTransaction(transaction, {
-                    skipPreflight: true,
-                    maxRetries: 5
-                });
-
-                logger.info(`Emergency sell transaction sent: ${txId}`);
-                
-                const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
-                await this.connection.confirmTransaction(
-                    {
-                        blockhash,
-                        lastValidBlockHeight,
-                        signature: txId,
-                    },
-                    'confirmed'
-                );
-                logger.info('Emergency sell transaction confirmed');
-            }
-        } catch (error) {
-            logger.error('Emergency sell failed:', error);
-            throw error;
-        }
-    }
-
     // Add methods to control BUY/SELL settings
     static enableBuying(enable: boolean) {
         ENABLE_BUY = enable;
@@ -552,32 +281,36 @@ export class SwapService {
     // Add helper method to verify transaction success
     public async verifyTransactionSuccess(signature: string): Promise<boolean> {
         try {
+            // Wait for finalization
+            await this.connection.confirmTransaction(signature, 'finalized');
+            
             const tx = await this.connection.getTransaction(signature, {
-                commitment: 'confirmed',
+                commitment: 'finalized',
                 maxSupportedTransactionVersion: 0
             });
 
-            if (!tx) {
-                logger.error(`Transaction ${signature} not found`);
+            if (!tx || tx.meta?.err) {
+                logger.error(`Transaction ${signature} failed:`, tx?.meta?.err || 'Transaction not found');
                 return false;
             }
 
-            if (tx.meta?.err) {
-                logger.error(`Transaction ${signature} failed with error:`, tx.meta.err);
-                return false;
-            }
-
-            // Check for specific program errors in logs
+            // Check logs for specific error patterns
             const logs = tx.meta?.logMessages || [];
+            const errorPatterns = [
+                'Error',
+                'Failed',
+                'Instruction #',
+                'Program Error',
+                'unknown instruction',
+                'Block not finalized'
+            ];
+
             const hasError = logs.some(log => 
-                log.includes('Error') || 
-                log.includes('Failed') || 
-                log.includes('Instruction #') || 
-                log.includes('Program Error')
+                errorPatterns.some(pattern => log.toLowerCase().includes(pattern.toLowerCase()))
             );
 
             if (hasError) {
-                logger.error(`Transaction ${signature} contains error in logs:`, logs);
+                logger.error(`Transaction ${signature} contains errors in logs:`, logs);
                 return false;
             }
 
@@ -587,39 +320,6 @@ export class SwapService {
             return false;
         }
     }
-
-    private async loadPendingSells(): Promise<void> {
-        try {
-            const data = await fs.readFile(this.PENDING_SELLS_FILE, 'utf8');
-            this.pendingSells = JSON.parse(data);
-        } catch (error) {
-            this.pendingSells = [];
-        }
-    }
-
-    private async savePendingSells(): Promise<void> {
-        await fs.writeFile(this.PENDING_SELLS_FILE, JSON.stringify(this.pendingSells, null, 2));
-    }
-
-    private async processPendingSells(): Promise<void> {
-        for (const sell of this.pendingSells) {
-            if (Date.now() - sell.lastAttempt > this.RETRY_INTERVALS[Math.min(sell.attempts, this.RETRY_INTERVALS.length - 1)]) {
-                try {
-                    await this.triggerEmergencySell(sell.mint);
-                    this.pendingSells = this.pendingSells.filter(s => s.mint !== sell.mint);
-                } catch (error) {
-                    sell.attempts++;
-                    sell.lastAttempt = Date.now();
-                    if (sell.attempts >= this.MAX_TOTAL_ATTEMPTS) {
-                        logger.error(`Critical: Failed to sell ${sell.mint} after ${sell.attempts} total attempts`);
-                        // Could add notification system here
-                    }
-                }
-                await this.savePendingSells();
-            }
-        }
-    }
-
     // Add static method to check if buying is enabled
     static isBuyingEnabled(): boolean {
         return ENABLE_BUY;

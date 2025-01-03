@@ -16,8 +16,18 @@ const connection = new Connection(RPC_ENDPOINT, {
 // Add connection check
 const checkConnection = async () => {
     try {
-        await connection.getLatestBlockhash();
-        logger.info('RPC connection established successfully');
+        // Test both HTTP and WebSocket connections
+        const [blockHash, slot] = await Promise.all([
+            connection.getLatestBlockhash(),
+            connection.getSlot()
+        ]);
+        
+        logger.info('RPC connections established successfully');
+        logger.info(`Current slot: ${slot}`);
+        
+        // Monitor WebSocket health
+        connection.onSlotChange(() => {/* Keep connection alive */});
+        
     } catch (error) {
         logger.error('Failed to connect to RPC:', error);
         process.exit(1);

@@ -9,6 +9,7 @@ interface TokenHolding {
     amount: number;
     targetAmount: number;
     lastChecked: number;
+    decimals: number;
 }
 
 export class TokenTracker {
@@ -46,11 +47,7 @@ export class TokenTracker {
         await fs.writeFile(this.HOLDINGS_FILE, JSON.stringify(this.holdings, null, 2));
     }
 
-    public async addHolding(mint: string, amount: number): Promise<void> {
-        // Get mint info to find decimals
-        const mintInfo = await this.connection.getParsedAccountInfo(new PublicKey(mint));
-        const decimals = (mintInfo.value?.data as any)?.parsed?.info?.decimals ?? 9;
-        
+    public async addHolding(mint: string, amount: number, decimals: number): Promise<void> {
         // Convert the raw amount to decimal-adjusted amount
         const adjustedAmount = amount / Math.pow(10, decimals);
         
@@ -58,10 +55,11 @@ export class TokenTracker {
             mint,
             amount: adjustedAmount,
             targetAmount: 0,
-            lastChecked: Date.now()
+            lastChecked: Date.now(),
+            decimals
         });
         await this.saveHoldings();
-        logger.info(`Added new holding: ${mint} with amount ${adjustedAmount}`);
+        logger.info(`Added new holding: ${mint} with amount ${adjustedAmount} (decimals: ${decimals})`);
     }
 
     private async sleep(ms: number): Promise<void> {
@@ -105,9 +103,17 @@ export class TokenTracker {
             return cached.balance;
         }
 
-        // Get mint info to find decimals
-        const mintInfo = await this.connection.getParsedAccountInfo(new PublicKey(mint));
-        const decimals = (mintInfo.value?.data as any)?.parsed?.info?.decimals ?? 9;
+        // First check if we have decimals stored in holdings
+        const holding = this.holdings.find(h => h.mint === mint);
+        let decimals: number;
+
+        if (holding?.decimals !== undefined) {
+            decimals = holding.decimals;
+        } else {
+            // Fallback to querying mint info
+            const mintInfo = await this.connection.getParsedAccountInfo(new PublicKey(mint));
+            decimals = (mintInfo.value?.data as any)?.parsed?.info?.decimals ?? 9;
+        }
 
         const accounts = await this.connection.getParsedTokenAccountsByOwner(
             owner,
